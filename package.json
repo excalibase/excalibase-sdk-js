@@ -1,0 +1,62 @@
+{
+  "name": "@excalibase/sdk",
+  "version": "0.1.0",
+  "description": "Official TypeScript client for Excalibase GraphQL and REST APIs",
+  "keywords": ["excalibase", "graphql", "postgres", "sdk", "client"],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/excalibase/excalibase-sdk-js"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./codegen": {
+      "types": "./dist/codegen/index.d.ts",
+      "import": "./dist/codegen/index.mjs",
+      "require": "./dist/codegen/index.js"
+    }
+  },
+  "bin": {
+    "excalibase-codegen": "./dist/bin/codegen.js"
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsup",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "graphql": "^16.8.0",
+    "graphql-request": "^6.1.0"
+  },
+  "peerDependencies": {
+    "ws": "^8.16.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.0",
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0",
+    "msw": "^2.2.0",
+    "ts-jest": "^29.1.2",
+    "tsup": "^8.0.2",
+    "typescript": "^5.4.0",
+    "undici": "^6.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

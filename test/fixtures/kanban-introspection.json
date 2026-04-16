@@ -1,0 +1,101 @@
+{
+  "__schema": {
+    "queryType": { "name": "Query" },
+    "mutationType": { "name": "Mutation" },
+    "types": [
+      {
+        "kind": "OBJECT",
+        "name": "Query",
+        "fields": [
+          {
+            "name": "kanbanIssues",
+            "type": {
+              "kind": "NON_NULL",
+              "ofType": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": { "kind": "OBJECT", "name": "KanbanIssue" }
+                }
+              }
+            },
+            "args": [
+              { "name": "where", "type": { "kind": "INPUT_OBJECT", "name": "KanbanIssueWhereInput" } },
+              { "name": "limit", "type": { "kind": "SCALAR", "name": "Int" } }
+            ]
+          },
+          {
+            "name": "kanbanIssuesAggregate",
+            "type": { "kind": "OBJECT", "name": "KanbanIssueAggregate" },
+            "args": []
+          },
+          {
+            "name": "kanbanUsers",
+            "type": {
+              "kind": "NON_NULL",
+              "ofType": {
+                "kind": "LIST",
+                "ofType": {
+                  "kind": "NON_NULL",
+                  "ofType": { "kind": "OBJECT", "name": "KanbanUser" }
+                }
+              }
+            },
+            "args": []
+          },
+          {
+            "name": "kanbanUsersAggregate",
+            "type": { "kind": "OBJECT", "name": "KanbanUserAggregate" },
+            "args": []
+          },
+          {
+            "name": "__typename",
+            "type": { "kind": "NON_NULL", "ofType": { "kind": "SCALAR", "name": "String" } },
+            "args": []
+          }
+        ]
+      },
+      {
+        "kind": "OBJECT",
+        "name": "KanbanIssue",
+        "fields": [
+          { "name": "id", "type": { "kind": "NON_NULL", "ofType": { "kind": "SCALAR", "name": "Int" } } },
+          { "name": "title", "type": { "kind": "NON_NULL", "ofType": { "kind": "SCALAR", "name": "String" } } },
+          { "name": "description", "type": { "kind": "SCALAR", "name": "String" } },
+          { "name": "status", "type": { "kind": "NON_NULL", "ofType": { "kind": "ENUM", "name": "KanbanIssueStatus" } } },
+          { "name": "priority", "type": { "kind": "ENUM", "name": "KanbanPriority" } },
+          { "name": "story_points", "type": { "kind": "SCALAR", "name": "Int" } },
+          { "name": "active", "type": { "kind": "NON_NULL", "ofType": { "kind": "SCALAR", "name": "Boolean" } } },
+          { "name": "created_at", "type": { "kind": "SCALAR", "name": "String" } }
+        ]
+      },
+      {
+        "kind": "OBJECT",
+        "name": "KanbanUser",
+        "fields": [
+          { "name": "id", "type": { "kind": "NON_NULL", "ofType": { "kind": "SCALAR", "name": "Int" } } },
+          { "name": "name", "type": { "kind": "NON_NULL", "ofType": { "kind": "SCALAR", "name": "String" } } },
+          { "name": "email", "type": { "kind": "SCALAR", "name": "String" } }
+        ]
+      },
+      {
+        "kind": "ENUM",
+        "name": "KanbanIssueStatus",
+        "enumValues": [
+          { "name": "todo" },
+          { "name": "in_progress" },
+          { "name": "done" }
+        ]
+      },
+      {
+        "kind": "ENUM",
+        "name": "KanbanPriority",
+        "enumValues": [
+          { "name": "low" },
+          { "name": "medium" },
+          { "name": "high" }
+        ]
+      }
+    ]
+  }
+}
