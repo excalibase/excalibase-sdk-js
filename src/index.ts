@@ -12,6 +12,11 @@ export type {
   OrderBySpec,
   RestDescriptor,
   Transport,
+  VectorSearchInput,
+  AggregateInput,
+  MutationKind,
+  ForceQuoted,
+  ForceUnquoted,
 } from "./query-builder";
 export { TokenManager, computeExpiresAt } from "./token-manager";
 export {

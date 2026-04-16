@@ -502,7 +502,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
 
   private serializeValue(_col: string, value: unknown, isEnum: boolean, schemaKnown: boolean): string {
     if (isEnum && typeof value === "string") return value;
-    if (schemaKnown && typeof value === "string" && !isForceQuoted(value as FilterValue) && !isForceUnquoted(value as FilterValue)) {
+    if (schemaKnown && typeof value === "string" && !isForceQuoted(value) && !isForceUnquoted(value)) {
       return JSON.stringify(value);
     }
     return serializeGraphqlValue(value);
@@ -585,7 +585,17 @@ function serializeRecord(record: Record<string, unknown>, enumColumns?: readonly
 function serializeRestWhere(where: WhereInput): string {
   const params = new URLSearchParams();
   for (const [col, ops] of Object.entries(where)) {
+    if (col === "_or") continue; // _or has no PostgREST equivalent — skip
     for (const [op, value] of Object.entries(ops) as Array<[FilterOp, FilterValue]>) {
+      if (op === "not") {
+        // PostgREST negation: prefix each inner op with `not.`
+        if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+          for (const [innerOp, innerVal] of Object.entries(value) as Array<[FilterOp, FilterValue]>) {
+            params.append(col, `not.${serializeRestFilter(innerOp, innerVal)}`);
+          }
+        }
+        continue;
+      }
       params.append(col, serializeRestFilter(op, value));
     }
   }
