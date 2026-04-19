@@ -141,3 +141,53 @@ describeLive("live: study-cases kanban tenant", () => {
     expect(data.__typename).toBe("Query");
   }, 30_000);
 });
+
+const NOSQL_URL = process.env.SDK_LIVE_NOSQL_URL ?? "";
+const describeNoSqlLive = NOSQL_URL.length > 0 ? describe : describe.skip;
+
+describeNoSqlLive("live: NoSQL search and vectorSearch", () => {
+  // These tests assume an excalibase-graphql instance with the NoSQL module
+  // mounted at /api/v1/nosql (e.g. the main dev stack on :10000). Auth is
+  // disabled in that stack, so the SDK client uses a bare fetch with no token.
+  function makeNoSqlDb() {
+    return createClient({
+      url: NOSQL_URL,
+      projectId: "sdk/live-nosql",
+      publishableKey: "esk_pub_live_dummy_nosql_smoke",
+      storage: memoryStorageAdapter(),
+      autoRefreshToken: false,
+    });
+  }
+  let db: ReturnType<typeof makeNoSqlDb>;
+
+  beforeAll(async () => {
+    db = makeNoSqlDb();
+    await db.nosql.init({
+      collections: {
+        sdk_live_articles: { fields: {}, indexes: [], search: "body" },
+        sdk_live_docs: { fields: {}, indexes: [], vector: { field: "embedding", dimensions: 3 } },
+      },
+    });
+    await db.nosql.collection("sdk_live_articles").insertMany([
+      { title: "a", body: "Postgres tsvector and tsquery power full-text search" },
+      { title: "b", body: "MySQL has its own full-text search implementation" },
+      { title: "c", body: "Pasta recipes with tomatoes" },
+    ]);
+    await db.nosql.collection("sdk_live_docs").insertMany([
+      { title: "d1" }, { title: "d2" },
+    ]);
+  }, 30_000);
+
+  it("search() returns matching docs ranked by relevance", async () => {
+    const results = await db.nosql.collection("sdk_live_articles").search("tsvector tsquery", { limit: 5 });
+    expect(Array.isArray(results)).toBe(true);
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect((results[0] as { title: string }).title).toBe("a");
+  }, 30_000);
+
+  it("vectorSearch() returns up to topK docs", async () => {
+    const results = await db.nosql.collection("sdk_live_docs").vectorSearch([1, 0, 0], { topK: 2 });
+    expect(Array.isArray(results)).toBe(true);
+    expect(results.length).toBeLessThanOrEqual(2);
+  }, 30_000);
+});
