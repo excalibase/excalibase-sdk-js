@@ -1,4 +1,6 @@
 export { createClient, DbClient } from "./client";
+export { defineSchema, defineCollection, CollectionClient, NoSqlNamespace } from "./nosql";
+export type { SchemaDeclaration, CollectionDef, IndexDef as NoSqlIndexDef, FindOptions, UpdateOp } from "./nosql";
 export type { DatabaseShape, AnyDatabase, RowOf } from "./client";
 export { AuthClient } from "./auth";
 export { GraphqlNamespace } from "./graphql-ns";

@@ -2,6 +2,7 @@ import { GraphQLClient } from "graphql-request";
 import { AuthClient } from "./auth";
 import { AuthError, ConfigError, NetworkError } from "./errors";
 import { GraphqlNamespace } from "./graphql-ns";
+import { NoSqlNamespace, type CollectionClient, type SchemaDeclaration } from "./nosql";
 import { QueryBuilder, type RestDescriptor } from "./query-builder";
 import { RestNamespace } from "./rest-ns";
 import { defaultStorage, type StorageAdapter } from "./storage";
@@ -48,6 +49,7 @@ export class DbClient<DB extends DatabaseShape = AnyDatabase> {
   readonly auth: AuthClient;
   readonly graphql: GraphqlNamespace;
   readonly rest: RestNamespace;
+  readonly nosql: NoSqlNamespace;
   readonly storage: StorageAdapter;
   readonly storageKey: string;
   readonly schema: SchemaMeta | undefined;
@@ -80,6 +82,7 @@ export class DbClient<DB extends DatabaseShape = AnyDatabase> {
     });
     this.graphql = new GraphqlNamespace(this);
     this.rest = new RestNamespace(this);
+    this.nosql = new NoSqlNamespace(this.url, this.fetchImpl, this.extraHeaders);
   }
 
   graphqlEndpoint(): string {
@@ -158,6 +161,25 @@ export class DbClient<DB extends DatabaseShape = AnyDatabase> {
     const resolvedRest = rest ?? meta?.rest;
     const enumColumns = meta?.enumColumns;
     return new QueryBuilder(this, graphqlField, resolvedRest, enumColumns);
+  }
+
+  /**
+   * Access a NoSQL document collection.
+   * @example
+   *   const users = await db.collection("users").find({ status: "active" });
+   */
+  collection(name: string): CollectionClient {
+    return this.nosql.collection(name);
+  }
+
+  /**
+   * Sync NoSQL schema with the server (creates collections + indexes).
+   * Call once at deploy/startup time.
+   * @example
+   *   await db.init({ collections: { users: { fields: { email: "string" }, indexes: [{ fields: ["email"], unique: true }] } } });
+   */
+  async init(schema: SchemaDeclaration): Promise<void> {
+    return this.nosql.init(schema);
   }
 
   /**
