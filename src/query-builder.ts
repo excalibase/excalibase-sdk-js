@@ -161,7 +161,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
 
   constructor(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private readonly db: DbClient<any>,
+    private readonly db: DbClient<any, any>,
     private readonly graphqlField: string,
     private readonly rest?: RestDescriptor,
     /**

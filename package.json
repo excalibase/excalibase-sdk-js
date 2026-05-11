@@ -1,8 +1,14 @@
 {
   "name": "@excalibase/sdk",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Official TypeScript client for Excalibase GraphQL and REST APIs",
-  "keywords": ["excalibase", "graphql", "postgres", "sdk", "client"],
+  "keywords": [
+    "excalibase",
+    "graphql",
+    "postgres",
+    "sdk",
+    "client"
+  ],
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -26,7 +32,11 @@
   "bin": {
     "excalibase-codegen": "./dist/bin/codegen.js"
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsup",
     "test": "jest",
@@ -37,13 +47,16 @@
   },
   "dependencies": {
     "graphql": "^16.8.0",
-    "graphql-request": "^6.1.0"
+    "graphql-request": "^6.1.0",
+    "json-schema-to-typescript": "^15.0.4"
   },
   "peerDependencies": {
     "ws": "^8.16.0"
   },
   "peerDependenciesMeta": {
-    "ws": { "optional": true }
+    "ws": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/jest": "^29.5.12",

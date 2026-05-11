@@ -1,6 +1,8 @@
 import { GraphQLClient } from "graphql-request";
 import { AuthClient } from "./auth";
 import { AuthError, ConfigError, NetworkError } from "./errors";
+import { FunctionsNamespace } from "./functions/namespace";
+import type { DefaultFunctions } from "./functions/types";
 import { GraphqlNamespace } from "./graphql-ns";
 import { NoSqlNamespace, type CollectionClient, type SchemaDeclaration } from "./nosql";
 import { QueryBuilder, type RestDescriptor } from "./query-builder";
@@ -40,7 +42,10 @@ const SECRET_KEY_PREFIX = "esk_sec_";
 const PUBLISHABLE_KEY_PREFIX = "esk_pub_";
 const DEFAULT_STORAGE_KEY = "excalibase.auth.session";
 
-export class DbClient<DB extends DatabaseShape = AnyDatabase> {
+export class DbClient<
+  DB extends DatabaseShape = AnyDatabase,
+  Functions = DefaultFunctions,
+> {
   readonly url: string;
   readonly projectId: string;
   readonly orgSlug: string;
@@ -50,6 +55,12 @@ export class DbClient<DB extends DatabaseShape = AnyDatabase> {
   readonly graphql: GraphqlNamespace;
   readonly rest: RestNamespace;
   readonly nosql: NoSqlNamespace;
+  /**
+   * Typed RPC namespace: `db.functions.<module>.<name>(args)`. The proxy
+   * resolves `.<module>.<name>` to a POST against
+   * `${url}/functions/v1/${projectId}/${module}.${name}` with `{ args }`.
+   */
+  readonly functions: Functions;
   readonly storage: StorageAdapter;
   readonly storageKey: string;
   readonly schema: SchemaMeta | undefined;
@@ -67,10 +78,15 @@ export class DbClient<DB extends DatabaseShape = AnyDatabase> {
     this.storage = opts.storage ?? defaultStorage();
     this.storageKey = opts.storageKey ?? `${DEFAULT_STORAGE_KEY}:${opts.projectId}`;
     this.schema = opts.schema;
-    this.fetchImpl = opts.fetch ?? (globalThis.fetch as typeof fetch);
-    if (typeof this.fetchImpl !== "function") {
+    // Bind fetch to globalThis. Calling `globalThis.fetch` via a property
+    // (`this.fetchImpl(url, init)`) detaches it from its Window receiver,
+    // which the browser rejects with "TypeError: Failed to execute 'fetch'
+    // on 'Window': Illegal invocation". Bind once at construction.
+    const rawFetch = opts.fetch ?? (globalThis.fetch as typeof fetch);
+    if (typeof rawFetch !== "function") {
       throw new ConfigError("global fetch is not available; pass `fetch` in createClient options");
     }
+    this.fetchImpl = rawFetch.bind(globalThis) as typeof fetch;
     this.extraHeaders = { ...(opts.headers ?? {}) };
 
     this.auth = new AuthClient({
@@ -83,6 +99,12 @@ export class DbClient<DB extends DatabaseShape = AnyDatabase> {
     this.graphql = new GraphqlNamespace(this);
     this.rest = new RestNamespace(this);
     this.nosql = new NoSqlNamespace(this.url, this.fetchImpl, this.extraHeaders);
+    this.functions = new FunctionsNamespace<Functions>({
+      url: this.url,
+      projectId: this.projectId,
+      headersFactory: () => this.buildHeaders(),
+      fetchImpl: this.fetchImpl,
+    }) as unknown as Functions;
   }
 
   graphqlEndpoint(): string {
@@ -297,8 +319,9 @@ function wrapGraphqlError(error: unknown): Error {
   return new NetworkError("Unknown GraphQL error", error);
 }
 
-export function createClient<DB extends DatabaseShape = AnyDatabase>(
-  opts: CreateClientOptions,
-): DbClient<DB> {
-  return new DbClient<DB>(opts);
+export function createClient<
+  DB extends DatabaseShape = AnyDatabase,
+  Functions = DefaultFunctions,
+>(opts: CreateClientOptions): DbClient<DB, Functions> {
+  return new DbClient<DB, Functions>(opts);
 }

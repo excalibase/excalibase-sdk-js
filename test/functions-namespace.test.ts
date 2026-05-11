@@ -134,6 +134,94 @@ describe("FunctionsNamespace (low-level)", () => {
     await ns._invoke("m", "n", {});
     expect(lastRequest()!.headers["Authorization"]).toBe("Bearer jwt-xyz");
   });
+
+  test("wraps fetch network errors as FunctionsError", async () => {
+    const failing: typeof fetch = (async () => {
+      throw new Error("econnrefused");
+    }) as typeof fetch;
+    const ns = new FunctionsNamespace({
+      url: "http://x",
+      projectId: "a/b",
+      headersFactory: () => ({}),
+      fetchImpl: failing,
+    });
+    let caught: unknown;
+    try {
+      await ns._invoke("m", "n", {});
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(FunctionsError);
+    expect((caught as FunctionsError).code).toBe("network_error");
+    expect((caught as FunctionsError).message).toContain("econnrefused");
+  });
+
+  test("extracts `message` field on error responses when `error` is absent", async () => {
+    const fetchImpl: typeof fetch = (async () =>
+      new Response(JSON.stringify({ message: "kaboom" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      })) as typeof fetch;
+    const ns = new FunctionsNamespace({
+      url: "http://x",
+      projectId: "a/b",
+      headersFactory: () => ({}),
+      fetchImpl,
+    });
+    await expect(ns._invoke("m", "n", {})).rejects.toMatchObject({
+      name: "FunctionsError",
+      message: expect.stringContaining("kaboom"),
+    });
+  });
+
+  test("falls back to default error message when body is non-JSON", async () => {
+    const fetchImpl: typeof fetch = (async () =>
+      new Response("not-json-at-all", { status: 502 })) as typeof fetch;
+    const ns = new FunctionsNamespace({
+      url: "http://x",
+      projectId: "a/b",
+      headersFactory: () => ({}),
+      fetchImpl,
+    });
+    await expect(ns._invoke("m", "n", {})).rejects.toMatchObject({
+      name: "FunctionsError",
+      message: expect.stringContaining("502"),
+    });
+  });
+
+  test("returns raw body when response has no `data` field (forward compat)", async () => {
+    const fetchImpl: typeof fetch = (async () =>
+      new Response(JSON.stringify({ raw: "stuff" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })) as typeof fetch;
+    const ns = new FunctionsNamespace({
+      url: "http://x",
+      projectId: "a/b",
+      headersFactory: () => ({}),
+      fetchImpl,
+    });
+    const out = await ns._invoke("m", "n", {});
+    expect(out).toEqual({ raw: "stuff" });
+  });
+
+  test("module handle then/catch/finally property access returns undefined (not callable)", async () => {
+    const { fetchImpl } = captureMockFetch({ body: { data: 1 } });
+    const ns = new FunctionsNamespace({
+      url: "http://x",
+      projectId: "a/b",
+      headersFactory: () => ({}),
+      fetchImpl,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mod = (ns as any).users;
+    expect(mod.then).toBeUndefined();
+    expect(mod.catch).toBeUndefined();
+    expect(mod.finally).toBeUndefined();
+    // Symbol property access on a module handle returns undefined.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((mod as any)[Symbol.iterator]).toBeUndefined();
+  });
 });
 
 describe("createClient → db.functions wiring", () => {

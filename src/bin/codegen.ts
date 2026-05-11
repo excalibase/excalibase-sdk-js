@@ -20,6 +20,7 @@
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { generateDatabaseFile } from "../codegen";
+import { generateFunctionsFile, type FunctionsMetadataResponse } from "../codegen/functions";
 
 const INTROSPECTION_QUERY = `
   query IntrospectionQuery {
@@ -162,11 +163,69 @@ export async function runCodegen(args: CliArgs, fetchImpl: typeof fetch = fetch)
   process.stdout.write(`✓ wrote ${args.out} (${code.split("\n").length} lines)\n`);
 }
 
+// --- functions subcommand ---
+
+/**
+ * Fetch the per-project function metadata from
+ * `GET /api/projects/{projectId}/functions/_metadata` and return the parsed
+ * JSON array. JWT-gated route — caller must pass either `--token` (bearer)
+ * or `--key` (publishable). `--project` is required since the URL is
+ * project-scoped.
+ */
+export async function fetchFunctionsMetadata(
+  args: CliArgs,
+  fetchImpl: typeof fetch = fetch,
+): Promise<FunctionsMetadataResponse> {
+  if (args.project == null || args.project.length === 0) {
+    throw new Error("--project is required for the functions subcommand");
+  }
+  const url = `${args.url}/api/projects/${args.project}/functions/_metadata`;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (args.token != null) headers["Authorization"] = `Bearer ${args.token}`;
+  if (args.key != null) headers["X-Excalibase-Publishable-Key"] = args.key;
+
+  const res = await fetchImpl(url, { method: "GET", headers });
+  if (!res.ok) {
+    throw new Error(`functions metadata fetch failed: HTTP ${res.status} ${res.statusText}`);
+  }
+  const json = (await res.json()) as unknown;
+  if (!Array.isArray(json)) {
+    throw new Error("functions metadata response was not a JSON array");
+  }
+  return json as FunctionsMetadataResponse;
+}
+
+export async function runFunctionsCodegen(
+  args: CliArgs,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const metadata = await fetchFunctionsMetadata(args, fetchImpl);
+  const code = await generateFunctionsFile(metadata);
+  const outPath = resolve(process.cwd(), args.out);
+  mkdirSync(dirname(outPath), { recursive: true });
+  writeFileSync(outPath, code, "utf-8");
+  process.stdout.write(`wrote ${args.out} (${code.split("\n").length} lines)\n`);
+}
+
 // CLI entrypoint — only runs when invoked as a script, not on import.
 if (require.main === module) {
-  const args = parseArgs(process.argv.slice(2));
-  runCodegen(args).catch((err: Error) => {
-    process.stderr.write(`✗ ${err.message}\n`);
-    process.exit(2);
-  });
+  const argv = process.argv.slice(2);
+  // First positional non-flag is the subcommand (default: database types).
+  const subcommand = argv.length > 0 && !argv[0]!.startsWith("--") ? argv[0]! : null;
+  const flags = subcommand != null ? argv.slice(1) : argv;
+  const args = parseArgs(flags);
+  if (subcommand === "functions") {
+    if (args.out === "./src/database.types.ts") args.out = "./src/functions.types.ts";
+    runFunctionsCodegen(args).catch((err: Error) => {
+      process.stderr.write(`functions codegen failed: ${err.message}\n`);
+      process.exit(2);
+    });
+  } else {
+    runCodegen(args).catch((err: Error) => {
+      process.stderr.write(`codegen failed: ${err.message}\n`);
+      process.exit(2);
+    });
+  }
 }

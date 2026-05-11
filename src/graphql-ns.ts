@@ -11,7 +11,7 @@ import type { DbClient } from "./client";
  */
 export class GraphqlNamespace {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  constructor(private readonly db: DbClient<any>) {}
+  constructor(private readonly db: DbClient<any, any>) {}
 
   /**
    * Execute a GraphQL query document.

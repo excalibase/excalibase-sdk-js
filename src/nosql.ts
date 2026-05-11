@@ -203,6 +203,27 @@ export class CollectionClient {
   }
 }
 
+// Module-level guard: emit the deprecation warning at most once per process,
+// regardless of how many clients/collections the user creates. Phase 4
+// removes `db.nosql.collection` outright; until then, we point users at the
+// migration path without spamming their logs.
+let nosqlDeprecationWarned = false;
+
+/** Test seam — resets the one-shot deprecation warning latch. */
+export function resetNoSqlDeprecationWarning(): void {
+  nosqlDeprecationWarned = false;
+}
+
+function warnNoSqlDeprecationOnce(): void {
+  if (nosqlDeprecationWarned) return;
+  nosqlDeprecationWarned = true;
+  // eslint-disable-next-line no-console
+  console.warn(
+    "[excalibase] db.nosql.collection(...) is deprecated and will be removed in a future release. " +
+      "Migrate to typed functions via db.functions.<module>.<name>(args) — see https://excalibase.dev/docs/migrate-nosql for details.",
+  );
+}
+
 export class NoSqlNamespace {
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
@@ -215,6 +236,7 @@ export class NoSqlNamespace {
   }
 
   collection(name: string): CollectionClient {
+    warnNoSqlDeprecationOnce();
     return new CollectionClient(this.baseUrl, name, this.fetchFn, this.headers);
   }
 

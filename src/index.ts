@@ -1,6 +1,10 @@
 export { createClient, DbClient } from "./client";
-export { defineSchema, defineCollection, CollectionClient, NoSqlNamespace } from "./nosql";
+export { defineSchema, defineCollection, CollectionClient, NoSqlNamespace, resetNoSqlDeprecationWarning } from "./nosql";
 export type { SchemaDeclaration, CollectionDef, IndexDef as NoSqlIndexDef, FindOptions, UpdateOp } from "./nosql";
+export { FunctionsNamespace } from "./functions/namespace";
+export { FunctionsError } from "./functions/error";
+export type { ValidationIssue } from "./functions/error";
+export type { FunctionRef, DefaultFunctions } from "./functions/types";
 export type { DatabaseShape, AnyDatabase, RowOf } from "./client";
 export { AuthClient } from "./auth";
 export { GraphqlNamespace } from "./graphql-ns";
