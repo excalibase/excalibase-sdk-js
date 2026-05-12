@@ -64,8 +64,11 @@ export class DbClient<
   readonly storage: StorageAdapter;
   readonly storageKey: string;
   readonly schema: SchemaMeta | undefined;
+  /** WebSocket URL for `.watch()` (Phase 9b.C); undefined disables reactive. */
+  readonly wsUrl: string | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly extraHeaders: Record<string, string>;
+  private readonly _functionsNs: FunctionsNamespace<Functions>;
 
   constructor(opts: CreateClientOptions) {
     validateOptions(opts);
@@ -99,12 +102,28 @@ export class DbClient<
     this.graphql = new GraphqlNamespace(this);
     this.rest = new RestNamespace(this);
     this.nosql = new NoSqlNamespace(this.url, this.fetchImpl, this.extraHeaders);
-    this.functions = new FunctionsNamespace<Functions>({
+    this.wsUrl = opts.wsUrl;
+    const fnsNs = new FunctionsNamespace<Functions>({
       url: this.url,
       projectId: this.projectId,
       headersFactory: () => this.buildHeaders(),
       fetchImpl: this.fetchImpl,
-    }) as unknown as Functions;
+      wsUrl: opts.wsUrl,
+      // Re-read the JWT on every WS (re)connect so refreshed tokens take
+      // effect on reconnect. Falls back to "" when there's no session.
+      jwtProvider: () => this.auth.currentSession()?.accessToken ?? "",
+    });
+    this._functionsNs = fnsNs;
+    this.functions = fnsNs as unknown as Functions;
+  }
+
+  /**
+   * Close the reactive WebSocket used for `db.functions.<m>.<n>().watch()`.
+   * No-op if no `.watch()` subscriptions were opened. Call on app teardown
+   * or when switching auth identity.
+   */
+  async functions_closeReactive(): Promise<void> {
+    await this._functionsNs._closeReactive();
   }
 
   graphqlEndpoint(): string {

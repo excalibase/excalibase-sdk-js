@@ -80,4 +80,10 @@ export interface CreateClientOptions {
    * for filter value serialization.
    */
   schema?: SchemaMeta;
+  /**
+   * Optional WebSocket endpoint for reactive `db.functions.<m>.<n>().watch()`
+   * subscriptions. Format: `ws(s)://<host>:<port>/functions/v1/{projectId}/_watch`.
+   * When omitted, calling `.watch()` throws — `await` paths still work.
+   */
+  wsUrl?: string;
 }
