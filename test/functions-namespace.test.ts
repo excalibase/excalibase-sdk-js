@@ -205,6 +205,52 @@ describe("FunctionsNamespace (low-level)", () => {
     expect(out).toEqual({ raw: "stuff" });
   });
 
+  test("direct `new FunctionsNamespace(opts)` is a usable public constructor (Phase 9b.H)", async () => {
+    // The e2e reactive suite + a future dev-CLI consumer construct
+    // FunctionsNamespace directly (bypassing createClient) to use opaque
+    // provisioning project ids on the WS path. This test pins that
+    // contract: the class is exported, `new` produces a working instance,
+    // the proxy + `.watch()` shape all work without going through DbClient.
+    const { fetchImpl, lastRequest } = captureMockFetch({ body: { data: { ok: 1 } } });
+    const ns = new FunctionsNamespace({
+      url: "http://localhost:24005",
+      projectId: "proj-fuekhuce64",
+      headersFactory: () => ({ Authorization: "Bearer jwt-opaque" }),
+      fetchImpl,
+      wsUrl: "ws://localhost:10004/api/v1/realtime",
+      jwtProvider: () => "jwt-opaque",
+    });
+    expect(ns).toBeInstanceOf(FunctionsNamespace);
+    // Proxy: `ns.<moduleName>.<exportName>(args)` returns a LazyQuery —
+    // thenable AND `.watch()`-able. Mirror the exact e2e shape.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const lazy = (ns as any).reactive_feed.default({});
+    expect(typeof lazy.then).toBe("function");
+    expect(typeof lazy.watch).toBe("function");
+    const out = await lazy;
+    expect(out).toEqual({ ok: 1 });
+    expect(lastRequest()!.url).toBe(
+      "http://localhost:24005/functions/v1/proj-fuekhuce64/reactive_feed.default",
+    );
+    expect(lastRequest()!.headers["Authorization"]).toBe("Bearer jwt-opaque");
+  });
+
+  test("direct construction exposes _invoke and _closeReactive as own methods", async () => {
+    // The reactive test calls `ns._closeReactive()` directly in afterAll —
+    // confirm both private-ish escape hatches survive the Proxy.
+    const ns = new FunctionsNamespace({
+      url: "http://x",
+      projectId: "proj_opaque",
+      headersFactory: () => ({}),
+      fetchImpl: (() => Promise.resolve(new Response("{}"))) as typeof fetch,
+    });
+    expect(typeof ns._invoke).toBe("function");
+    expect(typeof ns._closeReactive).toBe("function");
+    // Calling _closeReactive on a namespace that never opened a WS must
+    // resolve cleanly (no-op).
+    await expect(ns._closeReactive()).resolves.toBeUndefined();
+  });
+
   test("module handle then/catch/finally property access returns undefined (not callable)", async () => {
     const { fetchImpl } = captureMockFetch({ body: { data: 1 } });
     const ns = new FunctionsNamespace({
