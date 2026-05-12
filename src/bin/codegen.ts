@@ -18,9 +18,13 @@
  */
 
 import { writeFileSync, mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { generateDatabaseFile } from "../codegen";
-import { generateFunctionsFile, type FunctionsMetadataResponse } from "../codegen/functions";
+import {
+  generateApiFile,
+  generateFunctionsFile,
+  type FunctionsMetadataResponse,
+} from "../codegen/functions";
 
 const INTROSPECTION_QUERY = `
   query IntrospectionQuery {
@@ -58,7 +62,7 @@ const INTROSPECTION_QUERY = `
   }
 `;
 
-interface CliArgs {
+export interface CliArgs {
   url: string;
   /** Either a publishable key OR a JWT — exactly one must be set. */
   key?: string;
@@ -66,6 +70,12 @@ interface CliArgs {
   schemas: string[];
   out: string;
   project?: string;
+  /**
+   * Phase 7.1 — output path for the generated `api.ts` value graph. Defaults
+   * to `<dirname(out)>/api.ts` for the `functions` subcommand; unused for the
+   * default (database) codegen.
+   */
+  apiOut?: string;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -95,6 +105,7 @@ function parseArgs(argv: string[]): CliArgs {
     schemas: args.schemas != null && args.schemas.length > 0 ? args.schemas.split(",").map((s) => s.trim()).filter(Boolean) : [],
     out: args.out ?? "./src/database.types.ts",
     project: args.project,
+    apiOut: args["api-out"],
   };
 }
 
@@ -117,10 +128,20 @@ function printHelpAndExit(code: number): never {
       "  --project <slug>     orgSlug/projectName (sets the X-Excalibase-Project header)",
       "  --schemas <csv>      Multi-schema prefixes, comma-separated (e.g. kanban,ecommerce)",
       "  --out <path>         Output file (default: ./src/database.types.ts)",
+      "  --api-out <path>     [functions only] Output path for api.ts value graph",
+      "                       (default: <dirname(--out)>/api.ts)",
       "",
-      "Example:",
+      "Subcommands:",
+      "  functions            Generate functions.types.ts + api.ts from the",
+      "                       per-project functions metadata endpoint.",
+      "",
+      "Examples:",
       "  excalibase-codegen --url http://localhost:10004 \\",
       "    --key esk_pub_live_abc --schemas kanban --out src/database.types.ts",
+      "",
+      "  excalibase-codegen functions --url http://localhost:10004 \\",
+      "    --project acme/prod --token <jwt> \\",
+      "    --out src/functions.types.ts --api-out src/api.ts",
       "",
     ].join("\n"),
   );
@@ -202,11 +223,22 @@ export async function runFunctionsCodegen(
   fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
   const metadata = await fetchFunctionsMetadata(args, fetchImpl);
-  const code = await generateFunctionsFile(metadata);
-  const outPath = resolve(process.cwd(), args.out);
-  mkdirSync(dirname(outPath), { recursive: true });
-  writeFileSync(outPath, code, "utf-8");
-  process.stdout.write(`wrote ${args.out} (${code.split("\n").length} lines)\n`);
+
+  // 1. functions.types.ts — type-only `Functions` interface (Phase 2 surface).
+  const typesCode = await generateFunctionsFile(metadata);
+  const typesPath = resolve(process.cwd(), args.out);
+  mkdirSync(dirname(typesPath), { recursive: true });
+  writeFileSync(typesPath, typesCode, "utf-8");
+  process.stdout.write(`wrote ${args.out} (${typesCode.split("\n").length} lines)\n`);
+
+  // 2. api.ts — Phase 7.1 value graph (api + internal). Default path is a
+  // sibling `api.ts` next to functions.types.ts.
+  const apiOut = args.apiOut ?? join(dirname(args.out), "api.ts");
+  const apiCode = await generateApiFile(metadata);
+  const apiPath = resolve(process.cwd(), apiOut);
+  mkdirSync(dirname(apiPath), { recursive: true });
+  writeFileSync(apiPath, apiCode, "utf-8");
+  process.stdout.write(`wrote ${apiOut} (${apiCode.split("\n").length} lines)\n`);
 }
 
 // CLI entrypoint — only runs when invoked as a script, not on import.

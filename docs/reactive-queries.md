@@ -1,8 +1,79 @@
-# Reactive queries — `db.functions.<m>.<n>().watch()`
+# Reactive queries — `db.functions.<m>.<n>().watch()` + typed `api` graph
 
 Phase 9b.C added a `.watch()` API to `db.functions`. Every call still returns
 a thenable for `await` (one-shot HTTP), and now also exposes `.watch()` to
 subscribe to push updates over a WebSocket.
+
+Phase 7.1 added a parallel typed `api`/`internal` value graph emitted by
+codegen alongside `functions.types.ts`. Pass a ref like `api.users.list` to
+function runtime helpers (`ctx.runQuery`, `ctx.runMutation`) and TS infers
+both `args` and the return type from the ref.
+
+## Two paths, same metadata
+
+| Path | Use case | Typed? |
+|------|----------|--------|
+| `db.functions.users.list(args)` | Client-side RPC over HTTP / WS | Yes (via `Functions` generic, Phase 2) |
+| `ctx.runQuery(api.users.list, args)` | Function-to-function calls server-side | Yes (via `FunctionRef<Args, Result>`, Phase 7.1) |
+| `ctx.runMutation(internal.admin.cleanup, args)` | Internal-only graph (never exposed to clients) | Yes (Phase 7.1) |
+
+Codegen emits BOTH `functions.types.ts` (the type-only `Functions` interface)
+and `api.ts` (the runtime value graph) from the same metadata endpoint:
+
+```bash
+npx excalibase-codegen functions \
+  --url https://api.example.com \
+  --project acme/prod \
+  --token $JWT \
+  --out src/functions.types.ts \
+  --api-out src/api.ts        # optional; default: <dirname(--out)>/api.ts
+```
+
+Generated `api.ts` shape:
+
+```ts
+import type { FunctionRef } from "@excalibase/sdk";
+
+export interface Users_List_Args { status: string; limit?: number }
+// ...
+
+export const api = {
+  users: {
+    list: { moduleName: "users", exportName: "list", kind: "query" }
+            as FunctionRef<Users_List_Args, unknown>,
+    create: { moduleName: "users", exportName: "create", kind: "mutation" }
+            as FunctionRef<Users_Create_Args, unknown>,
+  },
+} as const;
+
+export const internal = {
+  admin: {
+    cleanup: { moduleName: "admin", exportName: "cleanup", kind: "internalMutation" }
+              as FunctionRef<Admin_Cleanup_Args, unknown>,
+  },
+} as const;
+```
+
+Call sites:
+
+```ts
+// Server-side (inside a function body) — typed via FunctionRef.
+const posts = await ctx.runQuery(api.users.list, { status: "active" });
+await ctx.runMutation(internal.admin.cleanup, { olderThanDays: 30 });
+
+// Client-side — Phase 2 surface still works.
+const posts2 = await db.functions.users.list({ status: "active" });
+```
+
+`internal` separates exports tagged `internalQuery`/`internalMutation`/
+`internalAction` from public ones. The SDK does not (and cannot) prevent a
+caller from typing `internal.admin.cleanup` directly — the separation is a
+discoverability + intent signal. The function runtime still enforces that
+internal exports are not callable over the public HTTP surface.
+
+> **Return-type inference (Phase 7.2)** — `TResult` is currently `unknown`.
+> Once the bundler emits a return-shape JSON Schema alongside `argsJsonSchema`,
+> codegen will swap `unknown` for the inferred type.
 
 ## Quick start
 
