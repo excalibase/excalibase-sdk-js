@@ -1,21 +1,28 @@
 /**
- * Phase 9b.C: `.watch()` reactive subscriptions for `db.functions.<mod>.<exp>`.
+ * Phase 15c: `.watch()` reactive subscriptions point at graphql's existing WS
+ * endpoint (was a sibling Deno port).
  *
- * Wire shape (pinned by Phase 9b.A on the Deno side):
- *   - Subprotocol: `excalibase-fn-v1`
- *   - JWT: query param `?token=<jwt>` (browser `new WebSocket(...)` can't set headers)
- *   - URL:   ws(s)://<host>:<wsPort>/functions/v1/{projectId}/_watch?token=<jwt>
- *   - Inbound: {op:"subscribe",subId,ref:{moduleName,exportName},args}
- *              {op:"unsubscribe",subId}
- *              {op:"ping"}
- *   - Outbound:{op:"result",subId,data,pageStatus?}
- *              {op:"error",subId,code,message}
- *              {op:"pong"}
+ * Wire shape (pinned by Phase 15a on the graphql side):
+ *   - Endpoint: `ws(s)://<graphql-host>:<port>/api/v1/realtime`
+ *     (same endpoint already used for collection-level CDC subscriptions —
+ *     one WS multiplexed across both function and collection subs).
+ *   - Auth: after WS open, the client sends
+ *       {"type":"connection_init","payload":{"Authorization":"Bearer <jwt>"}}
+ *     and waits for {"type":"connection_ack"} (5 s timeout).
+ *   - Inbound (client → server):
+ *       {"op":"subscribe-function","subId","projectId","ref":{moduleName,exportName},"args"}
+ *       {"op":"unsubscribe-function","subId"}
+ *   - Outbound (server → client):
+ *       {"op":"function-result","subId","data","pageStatus"?}
+ *       {"op":"function-error","subId","code","message"}
+ *   - Heartbeat: native WS ping/pong frames (browser/library handle these
+ *     transparently — no application-level ping op is sent by graphql 15a).
  *
  * These tests exercise the SDK side: that the Proxy returns a thenable
  * LazyQuery (await still works) AND a `.watch()` Subscription handle, that
- * the ReactiveWebSocket multiplexes subscriptions, reconnects with backoff,
- * resubscribes, surfaces pageStatus, and rejects when no wsUrl is configured.
+ * the ReactiveWebSocket multiplexes subscriptions across one socket, reconnects
+ * with backoff, replays connection_init + resubscribes pending subs after a
+ * disconnect, surfaces pageStatus, and rejects when no wsUrl is configured.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "@jest/globals";
@@ -26,20 +33,32 @@ import {
   ReactiveWebSocket,
   __setReconnectBackoff,
   __resetReconnectBackoff,
+  __setConnectionAckTimeoutForTest,
+  __resetConnectionAckTimeoutForTest,
 } from "../src/functions/reactive_ws";
 
-/** Picks a free TCP port by binding to :0 with the WS server. */
-function startMockWsServer(handler: (ws: WSWebSocket, url: string) => void): Promise<{
+/**
+ * Picks a free TCP port by binding to :0 with the WS server. The handler
+ * receives a flag telling it whether to auto-reply `connection_ack` for the
+ * `connection_init` frame (the default — what graphql 15a does). Tests that
+ * exercise the auth-timeout / nack paths flip `autoAck=false` and drive the
+ * server-side reply themselves.
+ */
+function startMockWsServer(
+  handler: (ws: WSWebSocket, url: string) => void,
+  opts: { autoAck?: boolean } = {},
+): Promise<{
   url: string;
   close: () => Promise<void>;
   wss: WebSocketServer;
   connections: () => number;
   lastConnectionUrl: () => string | null;
 }> {
+  const autoAck = opts.autoAck ?? true;
   return new Promise((resolve) => {
     let connectionCount = 0;
     let lastUrl: string | null = null;
-    const wss = new WebSocketServer({ port: 0, handleProtocols: () => "excalibase-fn-v1" });
+    const wss = new WebSocketServer({ port: 0 });
     wss.on("listening", () => {
       const address = wss.address();
       if (address == null || typeof address === "string") {
@@ -48,6 +67,23 @@ function startMockWsServer(handler: (ws: WSWebSocket, url: string) => void): Pro
       wss.on("connection", (ws, req) => {
         connectionCount += 1;
         lastUrl = req.url ?? "";
+        if (autoAck) {
+          // Hook the first connection_init frame and ack it; pass everything
+          // else through to the test handler.
+          const initListener = (raw: WSWebSocket.RawData): void => {
+            try {
+              const msg = JSON.parse(raw.toString());
+              if (msg.type === "connection_init") {
+                ws.off("message", initListener);
+                ws.send(JSON.stringify({ type: "connection_ack" }));
+                return;
+              }
+            } catch {
+              // ignore; pass through
+            }
+          };
+          ws.on("message", initListener);
+        }
         handler(ws, lastUrl);
       });
       resolve({
@@ -99,76 +135,288 @@ const baseOpts = {
 beforeEach(() => {
   // Speed up reconnect to 5ms..50ms for tests (override module-internal curve).
   __setReconnectBackoff({ baseMs: 5, capMs: 50, jitter: 0 });
+  // Tighten the connection_ack timeout so the auth-timeout tests don't have to
+  // wait 5 s. Production default is 5000 ms.
+  __setConnectionAckTimeoutForTest(120);
 });
 
 afterEach(() => {
   __resetReconnectBackoff();
+  __resetConnectionAckTimeoutForTest();
 });
 
-describe("ReactiveWebSocket — low-level WS multiplexing client", () => {
-  test("subscribe sends correct frame and dispatches result to onUpdate", async () => {
-    const received: unknown[] = [];
-    const sent: unknown[] = [];
-    const server = await startMockWsServer((ws) => {
+describe("ReactiveWebSocket — connection_init handshake (Phase 15c)", () => {
+  test("sends connection_init with Bearer <jwt> after WS open", async () => {
+    const initFrames: unknown[] = [];
+    const wss = new WebSocketServer({ port: 0 });
+    await new Promise<void>((r) => wss.on("listening", () => r()));
+    const address = wss.address();
+    if (address == null || typeof address === "string") throw new Error("addr");
+    wss.on("connection", (ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        sent.push(msg);
-        if (msg.op === "subscribe") {
-          ws.send(
-            JSON.stringify({ op: "result", subId: msg.subId, data: { hello: "world" } }),
-          );
+        if (msg.type === "connection_init") {
+          initFrames.push(msg);
+          ws.send(JSON.stringify({ type: "connection_ack" }));
+        } else if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
         }
       });
     });
     const ws = new ReactiveWebSocket({
-      url: `${server.url}/functions/v1/acme/prod/_watch`,
-      jwtProvider: async () => "jwt-1",
+      url: `ws://127.0.0.1:${address.port}/api/v1/realtime`,
+      projectId: "acme/prod",
+      jwtProvider: async () => "jwt-xyz",
     });
-    const unsub = ws.subscribe(
+    const got: unknown[] = [];
+    ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
+    await waitFor(() => got.length > 0, 2000, "got result after ack");
+    expect(initFrames).toHaveLength(1);
+    expect(initFrames[0]).toEqual({
+      type: "connection_init",
+      payload: { Authorization: "Bearer jwt-xyz" },
+    });
+    await ws.close();
+    await new Promise<void>((r) => wss.close(() => r()));
+  });
+
+  test("connection_init without a jwt sends an empty-Authorization payload", async () => {
+    const initFrames: unknown[] = [];
+    const wss = new WebSocketServer({ port: 0 });
+    await new Promise<void>((r) => wss.on("listening", () => r()));
+    const address = wss.address();
+    if (address == null || typeof address === "string") throw new Error("addr");
+    wss.on("connection", (ws) => {
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === "connection_init") {
+          initFrames.push(msg);
+          ws.send(JSON.stringify({ type: "connection_ack" }));
+        } else if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
+        }
+      });
+    });
+    const ws = new ReactiveWebSocket({
+      url: `ws://127.0.0.1:${address.port}/api/v1/realtime`,
+      projectId: "acme/prod",
+      jwtProvider: () => "",
+    });
+    const got: unknown[] = [];
+    ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
+    await waitFor(() => got.length > 0, 2000, "got result");
+    expect(initFrames[0]).toEqual({
+      type: "connection_init",
+      payload: { Authorization: "" },
+    });
+    await ws.close();
+    await new Promise<void>((r) => wss.close(() => r()));
+  });
+
+  test("waits for connection_ack before sending subscribe-function", async () => {
+    const order: string[] = [];
+    const wss = new WebSocketServer({ port: 0 });
+    await new Promise<void>((r) => wss.on("listening", () => r()));
+    const address = wss.address();
+    if (address == null || typeof address === "string") throw new Error("addr");
+    wss.on("connection", (ws) => {
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === "connection_init") {
+          order.push("init");
+          // Delay the ack to make any out-of-order subscribe-function obvious.
+          setTimeout(() => {
+            ws.send(JSON.stringify({ type: "connection_ack" }));
+          }, 30);
+        } else if (msg.op === "subscribe-function") {
+          order.push("sub");
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
+        }
+      });
+    });
+    const ws = new ReactiveWebSocket({
+      url: `ws://127.0.0.1:${address.port}/api/v1/realtime`,
+      projectId: "acme/prod",
+      jwtProvider: () => "t",
+    });
+    const got: unknown[] = [];
+    ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
+    await waitFor(() => got.length > 0, 2000, "result");
+    expect(order).toEqual(["init", "sub"]);
+    await ws.close();
+    await new Promise<void>((r) => wss.close(() => r()));
+  });
+
+  test("connection_ack never arrives → SubError({code:'auth_timeout'}) on every pending sub", async () => {
+    // Server accepts the connection but ignores connection_init forever.
+    const wss = new WebSocketServer({ port: 0 });
+    await new Promise<void>((r) => wss.on("listening", () => r()));
+    const address = wss.address();
+    if (address == null || typeof address === "string") throw new Error("addr");
+    wss.on("connection", (_ws) => {
+      // intentionally silent — no ack.
+    });
+    const ws = new ReactiveWebSocket({
+      url: `ws://127.0.0.1:${address.port}/api/v1/realtime`,
+      projectId: "acme/prod",
+      jwtProvider: () => "t",
+    });
+    const errs: Array<{ code: string; message: string }> = [];
+    ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, () => undefined, (e) => errs.push(e));
+    await waitFor(() => errs.length > 0, 2000, "auth_timeout surfaced");
+    expect(errs[0].code).toBe("auth_timeout");
+    expect(errs[0].message).toMatch(/connection_ack/i);
+    await ws.close();
+    await new Promise<void>((r) => wss.close(() => r()));
+  });
+
+  test("server closes immediately after connection_init (auth rejected) → SubError", async () => {
+    const wss = new WebSocketServer({ port: 0 });
+    await new Promise<void>((r) => wss.on("listening", () => r()));
+    const address = wss.address();
+    if (address == null || typeof address === "string") throw new Error("addr");
+    wss.on("connection", (ws) => {
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === "connection_init") {
+          ws.close(4401, "Invalid token");
+        }
+      });
+    });
+    const ws = new ReactiveWebSocket({
+      url: `ws://127.0.0.1:${address.port}/api/v1/realtime`,
+      projectId: "acme/prod",
+      jwtProvider: () => "bad-jwt",
+    });
+    const errs: Array<{ code: string; message: string }> = [];
+    ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, () => undefined, (e) => errs.push(e));
+    await waitFor(() => errs.length > 0, 2000, "auth error surfaced");
+    expect(errs[0].code).toBe("auth_timeout");
+    await ws.close();
+    await new Promise<void>((r) => wss.close(() => r()));
+  });
+});
+
+describe("ReactiveWebSocket — function subscription wire shape (Phase 15c)", () => {
+  test("subscribe sends subscribe-function with projectId + ref + args", async () => {
+    const sent: unknown[] = [];
+    const server = await startMockWsServer((ws) => {
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.op === "subscribe-function") {
+          sent.push(msg);
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: { hello: "world" } }));
+        }
+      });
+    });
+    const received: unknown[] = [];
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "acme/prod",
+      jwtProvider: () => "jwt-1",
+    });
+    ws.subscribe(
       "sub-1",
       { moduleName: "users", exportName: "list" },
       { status: "active" },
       (data) => received.push(data),
       () => undefined,
     );
-    await waitFor(() => received.length > 0, 2000, "result received");
+    await waitFor(() => received.length > 0, 2000, "result");
     expect(received).toEqual([{ hello: "world" }]);
     expect(sent[0]).toEqual({
-      op: "subscribe",
+      op: "subscribe-function",
       subId: "sub-1",
+      projectId: "acme/prod",
       ref: { moduleName: "users", exportName: "list" },
       args: { status: "active" },
     });
-    unsub();
     await ws.close();
     await server.close();
   });
 
-  test("connection URL carries ?token=<jwt> query param", async () => {
+  test("unsubscribe sends unsubscribe-function frame", async () => {
+    const received: unknown[] = [];
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: null }));
+        received.push(msg);
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
+        }
+      });
+    });
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "acme/prod",
+      jwtProvider: () => "t",
+    });
+    const got: unknown[] = [];
+    const unsub = ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
+    await waitFor(() => got.length > 0, 2000, "got result");
+    unsub();
+    await waitFor(
+      () => received.some((m) => (m as { op?: string }).op === "unsubscribe-function"),
+      2000,
+      "unsubscribe-function frame",
+    );
+    const frame = received.find((m) => (m as { op?: string }).op === "unsubscribe-function");
+    expect(frame).toEqual({ op: "unsubscribe-function", subId: "s" });
+    await ws.close();
+    await server.close();
+  });
+
+  test("function-result frame routes to onUpdate, pageStatus passthrough", async () => {
+    const server = await startMockWsServer((ws) => {
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({
+            op: "function-result",
+            subId: msg.subId,
+            data: { items: [{ id: 1 }] },
+            pageStatus: "SplitRequired",
+          }));
         }
       });
     });
     const got: unknown[] = [];
     const ws = new ReactiveWebSocket({
-      url: `${server.url}/functions/v1/acme/prod/_watch`,
-      jwtProvider: async () => "tok-abc-123",
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "acme/prod",
+      jwtProvider: () => "t",
     });
-    const unsub = ws.subscribe(
-      "s",
-      { moduleName: "m", exportName: "n" },
-      {},
-      (d) => got.push(d),
-      () => undefined,
-    );
-    await waitFor(() => got.length > 0, 2000, "any frame");
-    expect(server.lastConnectionUrl()).toContain("token=tok-abc-123");
-    expect(server.lastConnectionUrl()).toContain("/functions/v1/acme/prod/_watch");
-    unsub();
+    ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
+    await waitFor(() => got.length > 0, 2000, "result");
+    expect(got[0]).toEqual({ items: [{ id: 1 }] });
+    await ws.close();
+    await server.close();
+  });
+
+  test("function-error frame routes to onError with code+message", async () => {
+    const server = await startMockWsServer((ws) => {
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({
+            op: "function-error",
+            subId: msg.subId,
+            code: "invoke_failed_status_500",
+            message: "function crashed",
+          }));
+        }
+      });
+    });
+    const errs: Array<{ code: string; message: string }> = [];
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "acme/prod",
+      jwtProvider: () => "t",
+    });
+    ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, () => undefined, (e) => errs.push(e));
+    await waitFor(() => errs.length > 0, 2000, "error");
+    expect(errs[0].code).toBe("invoke_failed_status_500");
+    expect(errs[0].message).toBe("function crashed");
     await ws.close();
     await server.close();
   });
@@ -177,22 +425,21 @@ describe("ReactiveWebSocket — low-level WS multiplexing client", () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(
-            JSON.stringify({ op: "result", subId: msg.subId, data: { id: msg.subId } }),
-          );
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: { id: msg.subId } }));
         }
       });
     });
     const aResults: unknown[] = [];
     const bResults: unknown[] = [];
     const ws = new ReactiveWebSocket({
-      url: `${server.url}/functions/v1/x/y/_watch`,
-      jwtProvider: async () => "tk",
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "x/y",
+      jwtProvider: () => "tk",
     });
     ws.subscribe("a", { moduleName: "m", exportName: "n" }, {}, (d) => aResults.push(d), () => undefined);
     ws.subscribe("b", { moduleName: "m", exportName: "n" }, {}, (d) => bResults.push(d), () => undefined);
-    await waitFor(() => aResults.length > 0 && bResults.length > 0, 2000, "both subs got result");
+    await waitFor(() => aResults.length > 0 && bResults.length > 0, 2000, "both");
     expect(server.connections()).toBe(1);
     expect(aResults[0]).toEqual({ id: "a" });
     expect(bResults[0]).toEqual({ id: "b" });
@@ -204,26 +451,23 @@ describe("ReactiveWebSocket — low-level WS multiplexing client", () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe" && msg.subId === "bad") {
-          ws.send(
-            JSON.stringify({ op: "error", subId: "bad", code: "not_found", message: "no such fn" }),
-          );
-        } else if (msg.op === "subscribe") {
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: "ok" }));
+        if (msg.op === "subscribe-function" && msg.subId === "bad") {
+          ws.send(JSON.stringify({ op: "function-error", subId: "bad", code: "not_found", message: "no such fn" }));
+        } else if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: "ok" }));
         }
       });
     });
     const aErrors: Array<{ code: string; message: string }> = [];
     const bUpdates: unknown[] = [];
     const ws = new ReactiveWebSocket({
-      url: `${server.url}/_watch`,
-      jwtProvider: async () => "t",
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
     });
-    ws.subscribe("bad", { moduleName: "m", exportName: "missing" }, {}, () => undefined, (e) =>
-      aErrors.push(e),
-    );
+    ws.subscribe("bad", { moduleName: "m", exportName: "missing" }, {}, () => undefined, (e) => aErrors.push(e));
     ws.subscribe("good", { moduleName: "m", exportName: "n" }, {}, (d) => bUpdates.push(d), () => undefined);
-    await waitFor(() => aErrors.length > 0 && bUpdates.length > 0, 2000, "error + result");
+    await waitFor(() => aErrors.length > 0 && bUpdates.length > 0, 2000, "both routes fired");
     expect(aErrors[0].code).toBe("not_found");
     expect(aErrors[0].message).toBe("no such fn");
     expect(bUpdates[0]).toBe("ok");
@@ -231,118 +475,102 @@ describe("ReactiveWebSocket — low-level WS multiplexing client", () => {
     await server.close();
   });
 
-  test("client replies pong when server sends ping", async () => {
-    const pongs: unknown[] = [];
-    const server = await startMockWsServer((ws) => {
-      ws.on("message", (raw) => {
-        const msg = JSON.parse(raw.toString());
-        if (msg.op === "pong") pongs.push(msg);
-      });
-      // ping after the first subscribe to make sure the client is ready.
-      ws.on("message", (raw) => {
-        const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
-          ws.send(JSON.stringify({ op: "ping" }));
-        }
-      });
-    });
-    const ws = new ReactiveWebSocket({
-      url: `${server.url}/_watch`,
-      jwtProvider: async () => "t",
-    });
-    const got: unknown[] = [];
-    ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
-    await waitFor(() => pongs.length > 0, 2000, "server saw pong");
-    expect(pongs[0]).toEqual({ op: "pong" });
-    await ws.close();
-    await server.close();
-  });
-
-  test("on disconnect, reconnects with backoff and resubscribes pending subs", async () => {
+  test("on disconnect: reconnects, sends fresh connection_init, then resubscribes pending", async () => {
     let connectionNum = 0;
     const subscribeFramesByConn: Record<number, unknown[]> = {};
-    const server = await startMockWsServer((ws) => {
+    const initFramesByConn: Record<number, unknown[]> = {};
+    const wss = new WebSocketServer({ port: 0 });
+    await new Promise<void>((r) => wss.on("listening", () => r()));
+    const address = wss.address();
+    if (address == null || typeof address === "string") throw new Error("addr");
+    wss.on("connection", (ws) => {
       connectionNum += 1;
       const localConn = connectionNum;
       subscribeFramesByConn[localConn] = [];
+      initFramesByConn[localConn] = [];
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
+        if (msg.type === "connection_init") {
+          initFramesByConn[localConn]!.push(msg);
+          ws.send(JSON.stringify({ type: "connection_ack" }));
+          return;
+        }
+        if (msg.op === "subscribe-function") {
           subscribeFramesByConn[localConn]!.push(msg);
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: { c: localConn } }));
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: { c: localConn } }));
           if (localConn === 1) {
-            // Force a disconnect AFTER acking the subscribe.
             setTimeout(() => ws.terminate(), 10);
           }
         }
       });
     });
-    const updates: unknown[] = [];
-    const errors: unknown[] = [];
     const ws = new ReactiveWebSocket({
-      url: `${server.url}/_watch`,
-      jwtProvider: async () => "t",
+      url: `ws://127.0.0.1:${address.port}/api/v1/realtime`,
+      projectId: "acme/prod",
+      jwtProvider: () => "t",
     });
-    ws.subscribe("s1", { moduleName: "m", exportName: "n" }, { p: 1 }, (d) => updates.push(d), (e) =>
-      errors.push(e),
-    );
-    await waitFor(() => server.connections() >= 2, 5000, "second connection after reconnect");
+    ws.subscribe("s1", { moduleName: "m", exportName: "n" }, { p: 1 }, () => undefined, () => undefined);
+    await waitFor(() => connectionNum >= 2, 5000, "second connection");
     await waitFor(
       () => (subscribeFramesByConn[2]?.length ?? 0) > 0,
       5000,
       "resubscribe on second connection",
     );
-    // Frame on conn 2 must equal the original ref/args (re-issued from pending).
+    expect(initFramesByConn[2]!.length).toBe(1);
+    expect(initFramesByConn[2]![0]).toEqual({
+      type: "connection_init",
+      payload: { Authorization: "Bearer t" },
+    });
     expect(subscribeFramesByConn[2]![0]).toMatchObject({
-      op: "subscribe",
+      op: "subscribe-function",
       subId: "s1",
+      projectId: "acme/prod",
       ref: { moduleName: "m", exportName: "n" },
       args: { p: 1 },
     });
     await ws.close();
-    await server.close();
+    await new Promise<void>((r) => wss.close(() => r()));
   });
 
-  test("close() sends unsubscribe for active subs and closes the socket", async () => {
+  test("close() sends unsubscribe-function for active subs and closes the socket", async () => {
     const sentMessages: unknown[] = [];
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
         sentMessages.push(msg);
-        if (msg.op === "subscribe") {
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
         }
       });
     });
     const ws = new ReactiveWebSocket({
-      url: `${server.url}/_watch`,
-      jwtProvider: async () => "t",
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
     });
     const updates: unknown[] = [];
     ws.subscribe("s1", { moduleName: "m", exportName: "n" }, {}, (d) => updates.push(d), () => undefined);
     await waitFor(() => updates.length > 0, 2000, "got result");
     await ws.close();
     await waitFor(
-      () => sentMessages.some((m) => (m as { op?: string }).op === "unsubscribe"),
+      () => sentMessages.some((m) => (m as { op?: string }).op === "unsubscribe-function"),
       2000,
-      "saw unsubscribe frame",
+      "saw unsubscribe-function",
     );
-    const unsubFrame = sentMessages.find((m) => (m as { op?: string }).op === "unsubscribe");
-    expect(unsubFrame).toEqual({ op: "unsubscribe", subId: "s1" });
+    const frame = sentMessages.find((m) => (m as { op?: string }).op === "unsubscribe-function");
+    expect(frame).toEqual({ op: "unsubscribe-function", subId: "s1" });
     await server.close();
   });
 
-  test("unsubscribe handle stops further dispatches and sends unsubscribe frame", async () => {
+  test("unsubscribe handle stops further dispatches and sends unsubscribe-function", async () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
-          // Push a second update later to verify the unsub gate blocked it.
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
           setTimeout(() => {
             try {
-              ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 2 }));
+              ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 2 }));
             } catch {
               // ignore
             }
@@ -351,8 +579,9 @@ describe("ReactiveWebSocket — low-level WS multiplexing client", () => {
       });
     });
     const ws = new ReactiveWebSocket({
-      url: `${server.url}/_watch`,
-      jwtProvider: async () => "t",
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
     });
     const updates: unknown[] = [];
     const unsub = ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => updates.push(d), () => undefined);
@@ -365,8 +594,8 @@ describe("ReactiveWebSocket — low-level WS multiplexing client", () => {
   });
 });
 
-describe("LazyQuery — db.functions.<m>.<n>(args) thenable + .watch()", () => {
-  test("await still resolves via HTTP POST (backwards-compat with Phase 2)", async () => {
+describe("LazyQuery — db.functions.<m>.<n>(args) thenable + .watch() (Phase 15c)", () => {
+  test("await still resolves via HTTP POST (untouched by 15c)", async () => {
     let captured: { url: string; body: unknown } | null = null;
     const mockFetch: typeof fetch = (async (url: string, init?: RequestInit) => {
       captured = {
@@ -399,19 +628,20 @@ describe("LazyQuery — db.functions.<m>.<n>(args) thenable + .watch()", () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(
-            JSON.stringify({
-              op: "result",
-              subId: msg.subId,
-              data: [{ id: 1 }, { id: 2 }],
-              pageStatus: "SplitRecommended",
-            }),
-          );
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({
+            op: "function-result",
+            subId: msg.subId,
+            data: [{ id: 1 }, { id: 2 }],
+            pageStatus: "SplitRecommended",
+          }));
         }
       });
     });
-    const db = createClient({ ...baseOpts, wsUrl: `${server.url}/functions/v1/acme/prod/_watch` });
+    const db = createClient({
+      ...baseOpts,
+      wsUrl: `${server.url}/api/v1/realtime`,
+    });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const lazy = (db.functions as any).users.list({ q: "x" });
     const sub = lazy.watch();
@@ -420,7 +650,6 @@ describe("LazyQuery — db.functions.<m>.<n>(args) thenable + .watch()", () => {
     sub.onUpdate((d: unknown) => received.push(d));
     sub.onError((e: unknown) => errors.push(e));
     await waitFor(() => received.length > 0, 2000, "received update");
-    // pageStatus is passed through on the data envelope, NOT interpreted.
     expect(received[0]).toEqual([{ id: 1 }, { id: 2 }]);
     expect(errors).toEqual([]);
     sub.close();
@@ -435,13 +664,13 @@ describe("LazyQuery — db.functions.<m>.<n>(args) thenable + .watch()", () => {
       serverConn = ws;
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
+        if (msg.op === "subscribe-function") {
           lastSubId = msg.subId;
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: { v: 1 } }));
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: { v: 1 } }));
         }
       });
     });
-    const db = createClient({ ...baseOpts, wsUrl: `${server.url}/_watch` });
+    const db = createClient({ ...baseOpts, wsUrl: `${server.url}/api/v1/realtime` });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sub = (db.functions as any).users.list({}).watch();
     const got: unknown[] = [];
@@ -449,7 +678,7 @@ describe("LazyQuery — db.functions.<m>.<n>(args) thenable + .watch()", () => {
     await waitFor(() => got.length > 0, 2000, "update");
     off();
     if (serverConn != null && lastSubId != null) {
-      (serverConn as WSWebSocket).send(JSON.stringify({ op: "result", subId: lastSubId, data: { v: 2 } }));
+      (serverConn as WSWebSocket).send(JSON.stringify({ op: "function-result", subId: lastSubId, data: { v: 2 } }));
     }
     await new Promise((r) => setTimeout(r, 40));
     expect(got).toEqual([{ v: 1 }]);
@@ -462,19 +691,17 @@ describe("LazyQuery — db.functions.<m>.<n>(args) thenable + .watch()", () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(
-            JSON.stringify({
-              op: "result",
-              subId: msg.subId,
-              data: { items: [], pageStatus: "SplitRequired" },
-              pageStatus: "SplitRequired",
-            }),
-          );
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({
+            op: "function-result",
+            subId: msg.subId,
+            data: { items: [], pageStatus: "SplitRequired" },
+            pageStatus: "SplitRequired",
+          }));
         }
       });
     });
-    const db = createClient({ ...baseOpts, wsUrl: `${server.url}/_watch` });
+    const db = createClient({ ...baseOpts, wsUrl: `${server.url}/api/v1/realtime` });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sub = (db.functions as any).posts.list({}).watch();
     const updates: Array<{ items: unknown[]; pageStatus?: string }> = [];
@@ -490,12 +717,12 @@ describe("LazyQuery — db.functions.<m>.<n>(args) thenable + .watch()", () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: msg.subId }));
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: msg.subId }));
         }
       });
     });
-    const db = createClient({ ...baseOpts, wsUrl: `${server.url}/_watch` });
+    const db = createClient({ ...baseOpts, wsUrl: `${server.url}/api/v1/realtime` });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const fns = db.functions as any;
     const subA = fns.users.list({}).watch();
@@ -512,51 +739,70 @@ describe("LazyQuery — db.functions.<m>.<n>(args) thenable + .watch()", () => {
     await server.close();
   });
 
-  test("server-side onError frame is dispatched to .watch().onError handler", async () => {
+  test("server-side function-error frame is dispatched to .watch().onError handler", async () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(
-            JSON.stringify({
-              op: "error",
-              subId: msg.subId,
-              code: "permission_denied",
-              message: "row-level security blocked this query",
-            }),
-          );
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({
+            op: "function-error",
+            subId: msg.subId,
+            code: "unauthenticated",
+            message: "JWT required",
+          }));
         }
       });
     });
-    const db = createClient({ ...baseOpts, wsUrl: `${server.url}/_watch` });
+    const db = createClient({ ...baseOpts, wsUrl: `${server.url}/api/v1/realtime` });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sub = (db.functions as any).admin.listUsers({}).watch();
     const errs: Array<{ code: string; message: string }> = [];
     sub.onError((e: { code: string; message: string }) => errs.push(e));
     await waitFor(() => errs.length > 0, 2000, "error frame");
-    expect(errs[0].code).toBe("permission_denied");
-    expect(errs[0].message).toMatch(/row-level security/);
+    expect(errs[0].code).toBe("unauthenticated");
+    expect(errs[0].message).toMatch(/JWT required/);
     sub.close();
     await db.functions_closeReactive();
     await server.close();
+  });
+
+  test(".watch() auth_timeout surfaces when graphql ack is missing", async () => {
+    // Server accepts WS but never acks.
+    const wss = new WebSocketServer({ port: 0 });
+    await new Promise<void>((r) => wss.on("listening", () => r()));
+    const address = wss.address();
+    if (address == null || typeof address === "string") throw new Error("addr");
+    wss.on("connection", () => undefined);
+    const db = createClient({
+      ...baseOpts,
+      wsUrl: `ws://127.0.0.1:${address.port}/api/v1/realtime`,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sub = (db.functions as any).x.y({}).watch();
+    const errs: Array<{ code: string; message: string }> = [];
+    sub.onError((e: { code: string; message: string }) => errs.push(e));
+    await waitFor(() => errs.length > 0, 2000, "auth_timeout");
+    expect(errs[0].code).toBe("auth_timeout");
+    sub.close();
+    await db.functions_closeReactive();
+    await new Promise<void>((r) => wss.close(() => r()));
   });
 });
 
 describe("ReactiveWebSocket — coverage edges", () => {
   test("WebSocket constructor explicitly overridable via websocketImpl", async () => {
-    const sent: unknown[] = [];
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        sent.push(msg);
-        if (msg.op === "subscribe") {
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: "x" }));
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: "x" }));
         }
       });
     });
     const ws = new ReactiveWebSocket({
-      url: `${server.url}/_watch`,
-      jwtProvider: () => "sync-tok", // non-async path
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "sync-tok",
       websocketImpl: WSWebSocket as unknown as new (
         url: string,
         protocols?: string | string[],
@@ -571,62 +817,23 @@ describe("ReactiveWebSocket — coverage edges", () => {
     await server.close();
   });
 
-  test("token query param uses ? when url has no existing query, & when it does", async () => {
-    // We can't mount WS at a path with `?` reliably in mock server, so just
-    // hit appendTokenQuery via the connection URL on conn.
-    const captured: string[] = [];
-    const server = await startMockWsServer((ws, url) => {
-      captured.push(url);
-      ws.on("message", (raw) => {
-        const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
-      });
-    });
-    const a = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "tk" });
-    const done: unknown[] = [];
-    a.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => done.push(d), () => undefined);
-    await waitFor(() => done.length > 0, 2000, "first connect");
-    await a.close();
-    const b = new ReactiveWebSocket({ url: `${server.url}/p?x=1`, jwtProvider: () => "tk" });
-    const done2: unknown[] = [];
-    b.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => done2.push(d), () => undefined);
-    await waitFor(() => done2.length > 0, 2000, "second connect");
-    expect(captured[0]).toMatch(/\/p\?token=tk$/);
-    expect(captured[1]).toMatch(/\/p\?x=1&token=tk$/);
-    await b.close();
-    await server.close();
-  });
-
-  test("empty JWT does not append token query param", async () => {
-    const captured: string[] = [];
-    const server = await startMockWsServer((ws, url) => {
-      captured.push(url);
-      ws.on("message", (raw) => {
-        const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
-      });
-    });
-    const ws = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "" });
-    const got: unknown[] = [];
-    ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
-    await waitFor(() => got.length > 0, 2000, "result");
-    expect(captured[0]).not.toContain("token=");
-    await ws.close();
-    await server.close();
-  });
-
   test("jwtProvider throwing → log + reconnect still attempted with empty token", async () => {
-    const captured: string[] = [];
-    const server = await startMockWsServer((ws, url) => {
-      captured.push(url);
+    const initFrames: unknown[] = [];
+    const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
+        if (msg.type === "connection_init") {
+          initFrames.push(msg);
+        }
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
+        }
       });
     });
     const logs: unknown[] = [];
     const ws = new ReactiveWebSocket({
-      url: `${server.url}/p`,
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
       jwtProvider: async () => {
         throw new Error("no-token");
       },
@@ -636,7 +843,11 @@ describe("ReactiveWebSocket — coverage edges", () => {
     ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
     await waitFor(() => got.length > 0, 2000, "result");
     expect(logs.length).toBeGreaterThan(0);
-    expect(captured[0]).not.toContain("token=");
+    // init was still sent — with an empty Authorization.
+    expect(initFrames[0]).toEqual({
+      type: "connection_init",
+      payload: { Authorization: "" },
+    });
     await ws.close();
     await server.close();
   });
@@ -645,7 +856,11 @@ describe("ReactiveWebSocket — coverage edges", () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", () => undefined);
     });
-    const ws = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "t" });
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
+    });
     await ws.close();
     expect(() =>
       ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined),
@@ -657,13 +872,17 @@ describe("ReactiveWebSocket — coverage edges", () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
+        if (msg.op === "subscribe-function") {
           ws.send(JSON.stringify({ op: "unknown_op", subId: msg.subId }));
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 99 }));
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 99 }));
         }
       });
     });
-    const ws = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "t" });
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
+    });
     const got: unknown[] = [];
     ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
     await waitFor(() => got.length > 0, 2000, "result");
@@ -676,15 +895,16 @@ describe("ReactiveWebSocket — coverage edges", () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
+        if (msg.op === "subscribe-function") {
           ws.send("not-json");
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: "ok" }));
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: "ok" }));
         }
       });
     });
     const logs: unknown[] = [];
     const ws = new ReactiveWebSocket({
-      url: `${server.url}/p`,
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
       jwtProvider: () => "t",
       log: (...args) => logs.push(args),
     });
@@ -701,46 +921,45 @@ describe("ReactiveWebSocket — coverage edges", () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          // Ack the real sub.
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
-          // And a stale frame for a nonexistent sub.
-          ws.send(JSON.stringify({ op: "result", subId: "ghost", data: 999 }));
-          ws.send(JSON.stringify({ op: "error", subId: "ghost", code: "x", message: "y" }));
-          // result with no subId
-          ws.send(JSON.stringify({ op: "result" }));
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
+          ws.send(JSON.stringify({ op: "function-result", subId: "ghost", data: 999 }));
+          ws.send(JSON.stringify({ op: "function-error", subId: "ghost", code: "x", message: "y" }));
+          ws.send(JSON.stringify({ op: "function-result" }));
         }
       });
     });
-    const ws = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "t" });
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
+    });
     const got: unknown[] = [];
     const errs: unknown[] = [];
     ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), (e) => errs.push(e));
-    await new Promise((r) => setTimeout(r, 80));
+    await new Promise((r) => setTimeout(r, 100));
     expect(got).toEqual([1]);
     expect(errs).toEqual([]);
     await ws.close();
     await server.close();
   });
 
-  test("error frame without code/message falls back to default values", async () => {
+  test("function-error frame without code/message falls back to default values", async () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(JSON.stringify({ op: "error", subId: msg.subId }));
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-error", subId: msg.subId }));
         }
       });
     });
-    const ws = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "t" });
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
+    });
     const errs: Array<{ code: string; message: string }> = [];
-    ws.subscribe(
-      "s",
-      { moduleName: "m", exportName: "n" },
-      {},
-      () => undefined,
-      (e) => errs.push(e),
-    );
+    ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, () => undefined, (e) => errs.push(e));
     await waitFor(() => errs.length > 0, 2000, "error");
     expect(errs[0].code).toBe("subscription_error");
     expect(errs[0].message).toBe("subscription error");
@@ -756,14 +975,14 @@ describe("ReactiveWebSocket — coverage edges", () => {
       throw new Error("connect blew up");
     } as unknown as new (url: string, protocols?: string | string[]) => unknown;
     const ws = new ReactiveWebSocket({
-      url: "ws://127.0.0.1:1/p",
+      url: "ws://127.0.0.1:1/api/v1/realtime",
+      projectId: "p/q",
       jwtProvider: () => "t",
       websocketImpl: ThrowingCtor,
       log: (...args) => logs.push(args),
     });
     ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
     await new Promise((r) => setTimeout(r, 80));
-    // First call + at least one reconnect attempt.
     expect(calls).toBeGreaterThanOrEqual(2);
     expect(logs.some((args) => String((args as unknown[])[0]).includes("WS constructor"))).toBe(true);
     await ws.close();
@@ -773,12 +992,16 @@ describe("ReactiveWebSocket — coverage edges", () => {
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
         }
       });
     });
-    const ws = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "t" });
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
+    });
     const got: unknown[] = [];
     const unsub = ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
     await waitFor(() => got.length > 0, 2000, "first");
@@ -791,7 +1014,11 @@ describe("ReactiveWebSocket — coverage edges", () => {
   });
 
   test("close() with no subs and no socket is a no-op", async () => {
-    const ws = new ReactiveWebSocket({ url: "ws://127.0.0.1:1/p", jwtProvider: () => "t" });
+    const ws = new ReactiveWebSocket({
+      url: "ws://127.0.0.1:1/api/v1/realtime",
+      projectId: "p/q",
+      jwtProvider: () => "t",
+    });
     await ws.close();
     expect(ws.size()).toBe(0);
   });
@@ -802,17 +1029,20 @@ describe("ReactiveWebSocket — coverage edges", () => {
       connectionNum += 1;
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe") {
-          ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
+        if (msg.op === "subscribe-function") {
+          ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
         }
       });
     });
-    const ws = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "t" });
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
+    });
     const got: unknown[] = [];
     const unsub = ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
     await waitFor(() => got.length > 0, 2000, "ack");
     unsub();
-    // Force the server side to terminate; client has no live subs → no reconnect.
     for (const client of server.wss.clients) client.terminate();
     await new Promise((r) => setTimeout(r, 80));
     expect(connectionNum).toBe(1);
@@ -821,17 +1051,22 @@ describe("ReactiveWebSocket — coverage edges", () => {
   });
 
   test("resolveWebSocketCtor uses globalThis.WebSocket when present", async () => {
-    // Cover the browser-style branch without polluting globals permanently.
     const prev = (globalThis as { WebSocket?: unknown }).WebSocket;
     (globalThis as { WebSocket?: unknown }).WebSocket = WSWebSocket;
     try {
       const server = await startMockWsServer((ws) => {
         ws.on("message", (raw) => {
           const msg = JSON.parse(raw.toString());
-          if (msg.op === "subscribe") ws.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
+          if (msg.op === "subscribe-function") {
+            ws.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
+          }
         });
       });
-      const ws = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "t" });
+      const ws = new ReactiveWebSocket({
+        url: `${server.url}/api/v1/realtime`,
+        projectId: "p/q",
+        jwtProvider: () => "t",
+      });
       const got: unknown[] = [];
       ws.subscribe("s", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
       await waitFor(() => got.length > 0, 2000, "result");
@@ -848,10 +1083,6 @@ describe("ReactiveWebSocket — coverage edges", () => {
 });
 
 describe("ReactiveWebSocket — internal-path coverage with stub ctor", () => {
-  /**
-   * Build a stub WebSocket constructor that exposes the underlying instance
-   * so tests can drive open/message/close/error and assert sends.
-   */
   type StubListener = (ev: unknown) => void;
   interface StubSocket {
     url: string;
@@ -902,23 +1133,34 @@ describe("ReactiveWebSocket — internal-path coverage with stub ctor", () => {
     return { Ctor, instances };
   }
 
-  test("readyState===1 fast path: 2nd subscribe is sent over existing socket", async () => {
+  /** Helper: emit open, then drive the connection_ack handshake. */
+  function ackOpen(inst: StubSocket): void {
+    inst.readyState = 1;
+    inst._emit("open");
+    // openSocket sent connection_init synchronously; now ack it.
+    inst._emit("message", JSON.stringify({ type: "connection_ack" }));
+  }
+
+  test("readyState===1 fast path: 2nd subscribe is sent over existing socket without re-init", async () => {
     const { Ctor, instances } = makeStubCtor();
     const ws = new ReactiveWebSocket({
-      url: "ws://h/p",
+      url: "ws://h/api/v1/realtime",
+      projectId: "p/q",
       jwtProvider: () => "t",
       websocketImpl: Ctor,
     });
     ws.subscribe("a", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
     await flush();
-    // Simulate open. After open, sock.readyState===1 and pending sub frame is replayed.
     expect(instances.length).toBe(1);
-    instances[0]!.readyState = 1;
-    instances[0]!._emit("open");
-    expect(instances[0]!.sends.length).toBe(1);
-    // 2nd sub should take the fast path: socket exists, readyState===1.
-    ws.subscribe("b", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
+    ackOpen(instances[0]!);
+    // First send was connection_init; second is subscribe-function after ack.
     expect(instances[0]!.sends.length).toBe(2);
+    // 2nd sub: fast path because readyState===1 AND handshake complete.
+    ws.subscribe("b", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
+    expect(instances[0]!.sends.length).toBe(3);
+    // No fresh connection_init on the second subscribe.
+    const sends = instances[0]!.sends.map((s) => JSON.parse(s));
+    expect(sends.filter((m) => m.type === "connection_init").length).toBe(1);
     await ws.close();
   });
 
@@ -926,15 +1168,15 @@ describe("ReactiveWebSocket — internal-path coverage with stub ctor", () => {
     const { Ctor, instances } = makeStubCtor();
     const logs: unknown[] = [];
     const ws = new ReactiveWebSocket({
-      url: "ws://h/p",
+      url: "ws://h/api/v1/realtime",
+      projectId: "p/q",
       jwtProvider: () => "t",
       websocketImpl: Ctor,
       log: (...args) => logs.push(args),
     });
     ws.subscribe("a", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
     await flush();
-    instances[0]!.readyState = 1;
-    instances[0]!._emit("open");
+    ackOpen(instances[0]!);
     instances[0]!._emit("error", new Error("oops"));
     expect(logs.some((args) => String((args as unknown[])[0]).includes("ws error"))).toBe(true);
     await ws.close();
@@ -944,7 +1186,8 @@ describe("ReactiveWebSocket — internal-path coverage with stub ctor", () => {
     const { Ctor, instances } = makeStubCtor();
     const logs: unknown[] = [];
     const ws = new ReactiveWebSocket({
-      url: "ws://h/p",
+      url: "ws://h/api/v1/realtime",
+      projectId: "p/q",
       jwtProvider: () => "t",
       websocketImpl: Ctor,
       log: (...args) => logs.push(args),
@@ -953,7 +1196,7 @@ describe("ReactiveWebSocket — internal-path coverage with stub ctor", () => {
     await flush();
     instances[0]!.readyState = 1;
     instances[0]!.sendThrows = true;
-    instances[0]!._emit("open"); // triggers sendSubscribe → safeSend → throws
+    instances[0]!._emit("open"); // triggers connection_init via safeSend → throws
     expect(logs.some((args) => String((args as unknown[])[0]).includes("ws send failed"))).toBe(true);
     await ws.close();
   });
@@ -961,14 +1204,13 @@ describe("ReactiveWebSocket — internal-path coverage with stub ctor", () => {
   test("safeSend with not-yet-open socket is a no-op (no throw)", async () => {
     const { Ctor, instances } = makeStubCtor();
     const ws = new ReactiveWebSocket({
-      url: "ws://h/p",
+      url: "ws://h/api/v1/realtime",
+      projectId: "p/q",
       jwtProvider: () => "t",
       websocketImpl: Ctor,
     });
     ws.subscribe("a", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
     await flush();
-    // Don't emit 'open'. The pending subscribe is buffered. Now also call close()
-    // which sends unsubscribes via safeSend — readyState===0 makes it a no-op.
     expect(instances[0]!.sends.length).toBe(0);
     await ws.close();
     expect(instances[0]!.sends.length).toBe(0);
@@ -1002,7 +1244,8 @@ describe("ReactiveWebSocket — internal-path coverage with stub ctor", () => {
       return inst;
     } as unknown as new () => unknown;
     const ws = new ReactiveWebSocket({
-      url: "ws://h/p",
+      url: "ws://h/api/v1/realtime",
+      projectId: "p/q",
       jwtProvider: () => "t",
       websocketImpl: Ctor,
     });
@@ -1011,10 +1254,12 @@ describe("ReactiveWebSocket — internal-path coverage with stub ctor", () => {
     await flush();
     expect(openListener).not.toBeNull();
     expect(messageListener).not.toBeNull();
-    // Emit the message; even without 'open' firing readyState, handleMessage()
-    // unconditionally dispatches result/error frames to the registered subs.
+    // Drive the ack so subscribe-function is sent.
     (messageListener as unknown as (ev: unknown) => void)({
-      data: JSON.stringify({ op: "result", subId: "a", data: { ok: 1 } }),
+      data: JSON.stringify({ type: "connection_ack" }),
+    });
+    (messageListener as unknown as (ev: unknown) => void)({
+      data: JSON.stringify({ op: "function-result", subId: "a", data: { ok: 1 } }),
     });
     expect(updates).toEqual([{ ok: 1 }]);
     await ws.close();
@@ -1025,14 +1270,11 @@ describe("ReactiveWebSocket — internal-path coverage with stub ctor", () => {
       return { readyState: 0, send: () => undefined, close: () => undefined };
     } as unknown as new () => unknown;
     const ws = new ReactiveWebSocket({
-      url: "ws://h/p",
+      url: "ws://h/api/v1/realtime",
+      projectId: "p/q",
       jwtProvider: () => "t",
       websocketImpl: Ctor,
     });
-    // The throw happens inside openSocket → attachListener (async). Subscribe
-    // itself returns synchronously and never throws — the async openSocket
-    // surfaces the error via the unhandled-rejection channel. To keep Jest
-    // from treating that as a failure we install a temporary handler.
     const origListener = (process as { listeners: (e: string) => unknown[] }).listeners(
       "unhandledRejection",
     );
@@ -1045,24 +1287,30 @@ describe("ReactiveWebSocket — internal-path coverage with stub ctor", () => {
       await flush();
     } finally {
       process.off("unhandledRejection", tmp);
-      void origListener; // keep ref alive
+      void origListener;
     }
     await ws.close();
   });
 
   test("ws module resolver caches Node ctor after first use", async () => {
-    // Force the cached path: import twice; first call should populate cache,
-    // second should reuse it. We can't directly observe the cache, but we can
-    // confirm at least one ReactiveWebSocket without an explicit ctor works.
     const server = await startMockWsServer((wsConn) => {
       wsConn.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.op === "subscribe")
-          wsConn.send(JSON.stringify({ op: "result", subId: msg.subId, data: 1 }));
+        if (msg.op === "subscribe-function") {
+          wsConn.send(JSON.stringify({ op: "function-result", subId: msg.subId, data: 1 }));
+        }
       });
     });
-    const a = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "t" });
-    const b = new ReactiveWebSocket({ url: `${server.url}/p`, jwtProvider: () => "t" });
+    const a = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
+    });
+    const b = new ReactiveWebSocket({
+      url: `${server.url}/api/v1/realtime`,
+      projectId: "p/q",
+      jwtProvider: () => "t",
+    });
     const got: unknown[] = [];
     a.subscribe("s1", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
     b.subscribe("s2", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
@@ -1104,28 +1352,11 @@ describe("Reactive helpers — unit", () => {
     const { __extractMessageDataForTest } = await import("../src/functions/reactive_ws");
     expect(__extractMessageDataForTest(Buffer.from("raw", "utf8"))).toBe("raw");
   });
-  test("appendTokenQuery: empty token leaves url alone", async () => {
-    const { __appendTokenQueryForTest } = await import("../src/functions/reactive_ws");
-    expect(__appendTokenQueryForTest("ws://h/p", "")).toBe("ws://h/p");
-  });
-  test("appendTokenQuery: with ? when no query", async () => {
-    const { __appendTokenQueryForTest } = await import("../src/functions/reactive_ws");
-    expect(__appendTokenQueryForTest("ws://h/p", "abc")).toBe("ws://h/p?token=abc");
-  });
-  test("appendTokenQuery: with & when query present", async () => {
-    const { __appendTokenQueryForTest } = await import("../src/functions/reactive_ws");
-    expect(__appendTokenQueryForTest("ws://h/p?x=1", "abc")).toBe("ws://h/p?x=1&token=abc");
-  });
-  test("appendTokenQuery: URL-encodes token with special chars", async () => {
-    const { __appendTokenQueryForTest } = await import("../src/functions/reactive_ws");
-    expect(__appendTokenQueryForTest("ws://h/p", "a b+c")).toBe("ws://h/p?token=a%20b%2Bc");
-  });
   test("computeBackoffDelayForTest with jitter > 0 produces value in [min,max]", async () => {
     __resetReconnectBackoff();
     const { computeBackoffDelayForTest } = await import("../src/functions/reactive_ws");
     for (let i = 0; i < 20; i++) {
       const v = computeBackoffDelayForTest(0, 0.5);
-      // base 1000, jitter 0.5 → range [500, 1000]
       expect(v).toBeGreaterThanOrEqual(500);
       expect(v).toBeLessThanOrEqual(1000);
     }
@@ -1134,7 +1365,6 @@ describe("Reactive helpers — unit", () => {
 
 describe("Backoff curve", () => {
   test("first 5 reconnect delays follow exponential 1s→30s cap", async () => {
-    // Reset to production curve for this assertion only.
     __resetReconnectBackoff();
     const { computeBackoffDelayForTest } = await import("../src/functions/reactive_ws");
     const noJitter = (n: number) => computeBackoffDelayForTest(n, 0);
@@ -1143,7 +1373,7 @@ describe("Backoff curve", () => {
     expect(noJitter(2)).toBe(4000);
     expect(noJitter(3)).toBe(8000);
     expect(noJitter(4)).toBe(16000);
-    expect(noJitter(5)).toBe(30000); // capped
-    expect(noJitter(99)).toBe(30000); // still capped
+    expect(noJitter(5)).toBe(30000);
+    expect(noJitter(99)).toBe(30000);
   });
 });
