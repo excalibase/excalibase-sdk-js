@@ -13,7 +13,13 @@ module.exports = {
   moduleNameMapper: {
     "^prettier$": "<rootDir>/test/stubs/prettier-stub.js",
   },
-  collectCoverageFrom: ["src/**/*.ts", "!src/index.ts"],
+  // Exclude entry points (src/index.ts) and CLI bin scripts
+  // (src/bin/codegen.ts) from coverage collection. Both are I/O shells
+  // exercised by integration / live tests rather than the unit suite that
+  // gates this threshold; including them would let the bin script's
+  // argv-parsing branches drag the global down without any signal about
+  // the library's correctness.
+  collectCoverageFrom: ["src/**/*.ts", "!src/index.ts", "!src/bin/codegen.ts"],
   coverageThreshold: {
     global: {
       branches: 75,
