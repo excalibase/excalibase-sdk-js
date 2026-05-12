@@ -32,6 +32,12 @@ export {
   defaultStorage,
   type StorageAdapter,
 } from "./storage";
+export { FileStorageClient } from "./storage/client";
+export type {
+  FileStorageClientOptions,
+  UploadFileOptions,
+  UploadFileResult,
+} from "./storage/client";
 export { ExcalibaseError, AuthError, NetworkError, ConfigError } from "./errors";
 export type {
   User,

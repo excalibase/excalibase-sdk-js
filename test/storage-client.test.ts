@@ -189,6 +189,48 @@ describe("db.storage.uploadFile (Phase 10)", () => {
     ).rejects.toThrow(/blob/i);
   });
 
+  test("throws FunctionsError when the mutation returns an error envelope", async () => {
+    const { fetchImpl } = captureRoutes({
+      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
+        body: { error: "quota exceeded" },
+      },
+    });
+    const db = makeClient(fetchImpl);
+    const blob = new Blob(["x"], { type: "text/plain" });
+    await expect(db.storage.uploadFile(blob)).rejects.toThrow(/quota exceeded/);
+  });
+
+  test("falls back to storageId from the PUT response when the mutation didn't carry one", async () => {
+    // Mutation returns only the url; the PUT response body carries the id.
+    const { fetchImpl } = captureRoutes({
+      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
+        body: { data: { url: "https://r2.test/u?s=fb" } },
+      },
+      "PUT https://r2.test/u?s=fb": {
+        body: { storageId: "kg2_fromPut" },
+      },
+    });
+    const db = makeClient(fetchImpl);
+    const blob = new Blob(["x"], { type: "text/plain" });
+    const { storageId } = await db.storage.uploadFile(blob);
+    expect(storageId).toBe("kg2_fromPut");
+  });
+
+  test("throws when neither the mutation nor the PUT response carry a storageId", async () => {
+    const { fetchImpl } = captureRoutes({
+      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
+        body: { data: { url: "https://r2.test/u?s=no" } },
+      },
+      "PUT https://r2.test/u?s=no": {
+        body: "",
+        bodyType: "raw",
+      },
+    });
+    const db = makeClient(fetchImpl);
+    const blob = new Blob(["x"], { type: "text/plain" });
+    await expect(db.storage.uploadFile(blob)).rejects.toThrow(/storageId/);
+  });
+
   test("falls back to storageId from the response body when the PUT response doesn't carry one", async () => {
     // R2 PUTs typically don't echo storageId in the response; the SDK
     // must source it from the original mutation response (Convex parity).

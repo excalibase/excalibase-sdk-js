@@ -2,6 +2,40 @@
 
 All notable changes to `@excalibase/sdk`.
 
+## 0.6.0 — 2026-05-13
+
+### Added
+
+- **`db.storage.uploadFile(blob, opts?)`** — Convex-shape file-storage
+  client. Wraps the direct-upload pattern in one call: the SDK invokes a
+  developer-authored mutation that mints a signed PUT URL via
+  `ctx.storage.generateUploadUrl()`, PUTs the blob bytes directly to
+  that URL, and returns `{ storageId }`.
+
+  ```ts
+  const blob = await fetch("/local/file.png").then((r) => r.blob());
+  const { storageId } = await db.storage.uploadFile(blob);
+  await db.functions.messages.sendImage({ storageId, author: "alice" });
+  ```
+
+  By convention the SDK calls `api.system.generateUploadUrl`. Override
+  via `opts.ref`:
+
+  ```ts
+  await db.storage.uploadFile(blob, {
+    ref: { moduleName: "photos", exportName: "signUpload" },
+  });
+  ```
+
+### BREAKING
+
+- **`db.storage` is now the file-storage client** (Phase 10). The auth-
+  session persistence adapter moves to `db.tokenStorage`. The
+  `createClient({ storage })` option still configures the token adapter
+  for backwards-compat, but reading `db.storage` now returns the file
+  client. Callers that read the token adapter off `db.storage` need to
+  switch to `db.tokenStorage` — a one-line rename in app code.
+
 ## 0.5.0 — 2026-05-12
 
 ### BREAKING

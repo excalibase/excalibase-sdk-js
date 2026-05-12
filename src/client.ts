@@ -7,6 +7,7 @@ import { GraphqlNamespace } from "./graphql-ns";
 import { QueryBuilder, type RestDescriptor } from "./query-builder";
 import { RestNamespace } from "./rest-ns";
 import { defaultStorage, type StorageAdapter } from "./storage";
+import { FileStorageClient } from "./storage/client";
 import type { CreateClientOptions, SchemaMeta, Session } from "./types";
 
 /**
@@ -59,7 +60,24 @@ export class DbClient<
    * `${url}/functions/v1/${projectId}/${module}.${name}` with `{ args }`.
    */
   readonly functions: Functions;
-  readonly storage: StorageAdapter;
+  /**
+   * Phase 10 — Convex-shape file-storage client. Wraps the direct-upload
+   * pattern: call a developer-authored mutation to mint a signed PUT URL,
+   * PUT the blob bytes to that URL, return the minted storageId.
+   *
+   *   const { storageId } = await db.storage.uploadFile(blob);
+   *
+   * The auth-token persistence adapter is now on `tokenStorage`; this
+   * field was previously the StorageAdapter and is now the file client.
+   */
+  readonly storage: FileStorageClient;
+  /**
+   * Backing adapter for auth-session persistence (previously `db.storage`
+   * before Phase 10 reclaimed that slot for the file-storage client).
+   * Defaults to `localStorage` in a browser and an in-memory shim in
+   * Node.
+   */
+  readonly tokenStorage: StorageAdapter;
   readonly storageKey: string;
   readonly schema: SchemaMeta | undefined;
   /**
@@ -79,7 +97,7 @@ export class DbClient<
     this.orgSlug = orgSlug!;
     this.projectName = projectName!;
     this.publishableKey = opts.publishableKey;
-    this.storage = opts.storage ?? defaultStorage();
+    this.tokenStorage = opts.storage ?? defaultStorage();
     this.storageKey = opts.storageKey ?? `${DEFAULT_STORAGE_KEY}:${opts.projectId}`;
     this.schema = opts.schema;
     // Bind fetch to globalThis. Calling `globalThis.fetch` via a property
@@ -95,7 +113,7 @@ export class DbClient<
 
     this.auth = new AuthClient({
       client: this,
-      storage: this.storage,
+      storage: this.tokenStorage,
       storageKey: this.storageKey,
       autoRefreshToken: opts.autoRefreshToken ?? true,
       fetch: this.fetchImpl,
@@ -115,6 +133,16 @@ export class DbClient<
     });
     this._functionsNs = fnsNs;
     this.functions = fnsNs as unknown as Functions;
+
+    // Phase 10: file-storage client. Lives at `db.storage`. The token
+    // adapter persistence lives at `db.tokenStorage` from Phase 10
+    // onward (was `db.storage` before).
+    this.storage = new FileStorageClient({
+      url: this.url,
+      projectId: this.projectId,
+      fetchImpl: this.fetchImpl,
+      headersFactory: () => this.buildHeaders(),
+    });
   }
 
   /**
