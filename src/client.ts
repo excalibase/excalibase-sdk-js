@@ -93,9 +93,20 @@ export class DbClient<
     validateOptions(opts);
     this.url = stripTrailingSlash(opts.url);
     this.projectId = opts.projectId;
-    const [orgSlug, projectName] = opts.projectId.split("/");
-    this.orgSlug = orgSlug!;
-    this.projectName = projectName!;
+    // Phase 9b.H: support both slash-form (`{org}/{proj}` — legacy DbClient
+    // public surface) AND opaque ids (`proj-<10>` — what provisioning
+    // emits). For the opaque case both fields fall back to the full id so
+    // downstream consumers (e.g. authEndpoint()) still receive a
+    // well-formed string rather than `undefined`. Callers that rely on
+    // distinct org/project segments must continue using the slash form.
+    if (opts.projectId.includes("/")) {
+      const [orgSlug, projectName] = opts.projectId.split("/");
+      this.orgSlug = orgSlug!;
+      this.projectName = projectName!;
+    } else {
+      this.orgSlug = opts.projectId;
+      this.projectName = opts.projectId;
+    }
     this.publishableKey = opts.publishableKey;
     this.tokenStorage = opts.storage ?? defaultStorage();
     this.storageKey = opts.storageKey ?? `${DEFAULT_STORAGE_KEY}:${opts.projectId}`;
@@ -291,8 +302,17 @@ function validateOptions(opts: CreateClientOptions): void {
   if (!/^https?:\/\//.test(opts.url)) {
     throw new ConfigError("`url` must start with http:// or https://");
   }
-  if (typeof opts.projectId !== "string" || !/^[^/]+\/[^/]+$/.test(opts.projectId)) {
-    throw new ConfigError("`projectId` must be in the form '{orgSlug}/{projectName}'");
+  // Phase 9b.H — relaxed projectId regex. Accepts the legacy slash form
+  // (`{orgSlug}/{projectName}`) AND opaque ids that provisioning emits
+  // (`proj-<10>`, `proj_<10>`). The character set is locked to
+  // `[a-zA-Z0-9_\-./]` so a malformed id with whitespace, `@`, or other
+  // URL-significant chars still fails fast. Length-capped at 128 to
+  // bound URL length when the id is interpolated into function/auth
+  // endpoint paths.
+  if (typeof opts.projectId !== "string" || !/^[a-zA-Z0-9_\-./]{1,128}$/.test(opts.projectId)) {
+    throw new ConfigError(
+      "`projectId` must match `[a-zA-Z0-9_\\-./]{1,128}` — slash-form `{orgSlug}/{projectName}` or opaque `proj-xxxx`",
+    );
   }
   if (typeof opts.publishableKey !== "string" || opts.publishableKey.length === 0) {
     throw new ConfigError("`publishableKey` is required");

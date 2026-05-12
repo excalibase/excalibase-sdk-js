@@ -2,6 +2,38 @@
 
 All notable changes to `@excalibase/sdk`.
 
+## 0.7.0 — 2026-05-13
+
+### BREAKING
+
+- **Relaxed `createClient` `projectId` regex.** The previous regex only
+  accepted the slash form `{orgSlug}/{projectName}`. Provisioning emits
+  opaque project ids (e.g. `proj-fuekhuce64`) that don't carry a slash,
+  so external consumers (e2e suite, dev CLI) had to bypass `createClient`
+  and construct `FunctionsNamespace` directly. The new regex is
+  `^[a-zA-Z0-9_\-./]{1,128}$` — both forms are now accepted.
+
+  For opaque ids the `db.orgSlug` and `db.projectName` fields both fall
+  back to the full id (rather than `undefined`). `db.authEndpoint()` and
+  every other internal consumer continue to produce well-formed URLs.
+
+  Existing slash-form callers (`projectId: "acme/prod"`) are
+  unaffected — the regex still matches, and the split-on-`/` derivation
+  still yields the original two segments.
+
+  This is marked BREAKING because callers that previously passed an
+  invalid id (e.g. `bad@id`) and relied on the ConfigError to fire will
+  still throw — but the *message* changed to mention the new regex.
+
+### Added
+
+- **`FunctionsNamespace` is a first-class public export.** The class was
+  always re-exported from `src/index.ts`, but Phase 9b.H now pins this
+  via an explicit unit test (direct `new FunctionsNamespace(opts)`
+  construction with `wsUrl` + `jwtProvider`, exercising the Proxy +
+  `.watch()` shape). External callers — the reactive e2e suite and the
+  upcoming dev-CLI — depend on this contract.
+
 ## 0.6.0 — 2026-05-13
 
 ### Added
