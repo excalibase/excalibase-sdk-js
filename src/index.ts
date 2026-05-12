@@ -1,6 +1,4 @@
 export { createClient, DbClient } from "./client";
-export { defineSchema, defineCollection, CollectionClient, NoSqlNamespace, resetNoSqlDeprecationWarning } from "./nosql";
-export type { SchemaDeclaration, CollectionDef, IndexDef as NoSqlIndexDef, FindOptions, UpdateOp } from "./nosql";
 export { FunctionsNamespace } from "./functions/namespace";
 export type { LazyQuery, Subscription as FunctionsSubscription } from "./functions/namespace";
 export { FunctionsError } from "./functions/error";

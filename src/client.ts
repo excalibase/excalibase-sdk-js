@@ -4,7 +4,6 @@ import { AuthError, ConfigError, NetworkError } from "./errors";
 import { FunctionsNamespace } from "./functions/namespace";
 import type { DefaultFunctions } from "./functions/types";
 import { GraphqlNamespace } from "./graphql-ns";
-import { NoSqlNamespace, type CollectionClient, type SchemaDeclaration } from "./nosql";
 import { QueryBuilder, type RestDescriptor } from "./query-builder";
 import { RestNamespace } from "./rest-ns";
 import { defaultStorage, type StorageAdapter } from "./storage";
@@ -54,7 +53,6 @@ export class DbClient<
   readonly auth: AuthClient;
   readonly graphql: GraphqlNamespace;
   readonly rest: RestNamespace;
-  readonly nosql: NoSqlNamespace;
   /**
    * Typed RPC namespace: `db.functions.<module>.<name>(args)`. The proxy
    * resolves `.<module>.<name>` to a POST against
@@ -101,7 +99,6 @@ export class DbClient<
     });
     this.graphql = new GraphqlNamespace(this);
     this.rest = new RestNamespace(this);
-    this.nosql = new NoSqlNamespace(this.url, this.fetchImpl, this.extraHeaders);
     this.wsUrl = opts.wsUrl;
     const fnsNs = new FunctionsNamespace<Functions>({
       url: this.url,
@@ -202,25 +199,6 @@ export class DbClient<
     const resolvedRest = rest ?? meta?.rest;
     const enumColumns = meta?.enumColumns;
     return new QueryBuilder(this, graphqlField, resolvedRest, enumColumns);
-  }
-
-  /**
-   * Access a NoSQL document collection.
-   * @example
-   *   const users = await db.collection("users").find({ status: "active" });
-   */
-  collection(name: string): CollectionClient {
-    return this.nosql.collection(name);
-  }
-
-  /**
-   * Sync NoSQL schema with the server (creates collections + indexes).
-   * Call once at deploy/startup time.
-   * @example
-   *   await db.init({ collections: { users: { fields: { email: "string" }, indexes: [{ fields: ["email"], unique: true }] } } });
-   */
-  async init(schema: SchemaDeclaration): Promise<void> {
-    return this.nosql.init(schema);
   }
 
   /**
