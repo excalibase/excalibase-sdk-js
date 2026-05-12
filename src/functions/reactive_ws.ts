@@ -1,22 +1,29 @@
 /**
- * Phase 9b.C: reactive WebSocket client for `db.functions.<m>.<n>().watch()`.
+ * Phase 15c: reactive WebSocket client for `db.functions.<m>.<n>().watch()`.
  *
- * One WS per `db` client, multiplexing all subscriptions. Wire shape (set by
- * the Deno function-runtime sibling port in Phase 9b.A):
+ * Connects to the SAME WebSocket endpoint as the existing collection-level
+ * CDC subscriptions on the graphql server — `ws(s)://<host>/api/v1/realtime` —
+ * and multiplexes function-level subscriptions on top of the same socket.
  *
- *   - Subprotocol: `excalibase-fn-v1`
- *   - JWT: `?token=<jwt>` query param (browser `new WebSocket(...)` cannot
- *     set HTTP headers, so query param is the only portable carrier).
- *   - URL:   ws(s)://<host>:<wsPort>/functions/v1/{projectId}/_watch?token=<jwt>
- *   - Client→server: {op:"subscribe",subId,ref:{moduleName,exportName},args}
- *                    {op:"unsubscribe",subId}
- *                    {op:"pong"}
- *   - Server→client: {op:"result",subId,data,pageStatus?}
- *                    {op:"error",subId,code,message}
- *                    {op:"ping"}
+ *   - Auth handshake: after WS open, the client sends
+ *       {"type":"connection_init","payload":{"Authorization":"Bearer <jwt>"}}
+ *     and waits for {"type":"connection_ack"} (5 s timeout, configurable via
+ *     {@link __setConnectionAckTimeoutForTest}). Until ack arrives, no
+ *     `subscribe-function` frames are sent; on timeout or hard disconnect
+ *     before ack, every pending sub receives a `SubError({code:"auth_timeout"})`.
+ *   - Client→server (after ack):
+ *       {op:"subscribe-function",  subId, projectId, ref:{moduleName,exportName}, args}
+ *       {op:"unsubscribe-function",subId}
+ *   - Server→client:
+ *       {op:"function-result",subId,data,pageStatus?}
+ *       {op:"function-error",subId,code,message}
+ *   - Heartbeat: graphql 15a uses native WebSocket ping/pong frames; the
+ *     browser / `ws` library handle them transparently. No application-level
+ *     ping op is sent by the server, so the client does not need to reply.
  *
- * Reconnect strategy: exponential 1s → 30s cap (with jitter), pending subs
- * are replayed on the new socket. JWT is re-read on every connect attempt.
+ * Reconnect strategy: exponential 1s → 30s cap (with ±20% jitter), pending
+ * subs are replayed on the new socket. JWT is re-read and a fresh
+ * `connection_init` is sent on every (re)connect attempt.
  *
  * Runtime: prefers `globalThis.WebSocket` (browser, Deno, Node ≥22). Falls
  * back to the `ws` peer dep (Node 18–21). `ws` is declared as an optional
@@ -29,8 +36,10 @@ export interface FunctionRefMsg {
 }
 
 export interface ReactiveWebSocketOptions {
-  /** Full WS URL — `_watch` endpoint. Token is appended as `?token=<jwt>`. */
+  /** Full WS URL — e.g. `ws(s)://<host>/api/v1/realtime`. */
   url: string;
+  /** `{orgSlug}/{projectName}` — appended to every `subscribe-function` frame. */
+  projectId: string;
   /** Returns the current JWT. Called on every (re)connect. May return ''. */
   jwtProvider: () => Promise<string> | string;
   /** Optional diagnostic logger; never required. */
@@ -99,6 +108,21 @@ export function computeBackoffDelayForTest(attempt: number, jitter: number = act
   return Math.round(min + Math.random() * (raw - min));
 }
 
+// ---------- connection_ack timeout (module-scoped, test-overridable) ----------
+
+const PROD_ACK_TIMEOUT_MS = 5000;
+let activeAckTimeoutMs = PROD_ACK_TIMEOUT_MS;
+
+/** Test hook — shorten the connection_ack wait for fast unit tests. */
+export function __setConnectionAckTimeoutForTest(ms: number): void {
+  activeAckTimeoutMs = ms;
+}
+
+/** Test hook — reset to the production 5 s ack timeout. */
+export function __resetConnectionAckTimeoutForTest(): void {
+  activeAckTimeoutMs = PROD_ACK_TIMEOUT_MS;
+}
+
 // ---------- Constructor resolution ----------
 
 let cachedNodeWsCtor: WebSocketCtor | null = null;
@@ -143,6 +167,10 @@ export class ReactiveWebSocket {
   private closed = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True once the current socket has received `connection_ack`. */
+  private ackReceived = false;
+  /** Timer that fires `auth_timeout` if no ack arrives in time. */
+  private ackTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: ReactiveWebSocketOptions) {
     this.options = options;
@@ -151,7 +179,7 @@ export class ReactiveWebSocket {
 
   /**
    * Register a subscription. Returns an unsubscribe function that sends a
-   * server-side `{op:"unsubscribe"}` and stops further client dispatches.
+   * server-side `{op:"unsubscribe-function"}` and stops further dispatches.
    */
   subscribe(
     subId: string,
@@ -176,9 +204,10 @@ export class ReactiveWebSocket {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.clearAckTimer();
     for (const sub of this.subs.values()) {
       if (!sub.closed) {
-        this.safeSend({ op: "unsubscribe", subId: sub.subId });
+        this.safeSend({ op: "unsubscribe-function", subId: sub.subId });
         sub.closed = true;
       }
     }
@@ -205,14 +234,14 @@ export class ReactiveWebSocket {
     const sub = this.subs.get(subId);
     if (sub == null) return;
     if (!sub.closed) {
-      this.safeSend({ op: "unsubscribe", subId });
+      this.safeSend({ op: "unsubscribe-function", subId });
       sub.closed = true;
     }
     this.subs.delete(subId);
   }
 
   private async ensureSocketAndSend(sub: PendingSub): Promise<void> {
-    if (this.socket != null && (this.socket.readyState as ReadyState) === 1) {
+    if (this.socket != null && (this.socket.readyState as ReadyState) === 1 && this.ackReceived) {
       this.sendSubscribe(sub);
       return;
     }
@@ -223,17 +252,16 @@ export class ReactiveWebSocket {
     if (this.connecting) return;
     if (this.closed) return;
     this.connecting = true;
+    this.ackReceived = false;
     let token = "";
     try {
       token = await Promise.resolve(this.options.jwtProvider());
     } catch (err) {
       this.options.log?.("jwtProvider threw; reconnecting", err);
     }
-    const fullUrl = appendTokenQuery(this.options.url, token);
     let sock: WSLike;
     try {
-      // Subprotocol negotiation: browsers honor `protocols`; Node ws accepts it too.
-      sock = new this.Ctor(fullUrl, ["excalibase-fn-v1"]) as WSLike;
+      sock = new this.Ctor(this.options.url) as WSLike;
     } catch (err) {
       this.connecting = false;
       this.options.log?.("WS constructor threw", err);
@@ -244,18 +272,30 @@ export class ReactiveWebSocket {
     const wireOpen = (): void => {
       this.connecting = false;
       this.reconnectAttempts = 0;
-      // Replay all pending subscribe frames in insertion order.
-      for (const sub of this.subs.values()) {
-        if (!sub.closed) this.sendSubscribe(sub);
-      }
+      // Send `connection_init` immediately and arm the ack timeout. Pending
+      // subscribes wait for the ack before any `subscribe-function` is sent.
+      this.safeSend({
+        type: "connection_init",
+        payload: { Authorization: token === "" ? "" : `Bearer ${token}` },
+      });
+      this.armAckTimer();
     };
     const wireMessage = (data: unknown): void => {
       this.handleMessage(extractMessageData(data));
     };
     const wireClose = (): void => {
+      const wasMidHandshake = !this.ackReceived;
+      this.clearAckTimer();
       this.socket = null;
       this.connecting = false;
       if (this.closed) return;
+      // If the socket was closed BEFORE the handshake completed, surface an
+      // auth_timeout on every pending sub — graphql closes the WS when JWT
+      // verification fails after `connection_init`. Tests cover both the
+      // silent-server (timeout) and hard-close (post-init) paths.
+      if (wasMidHandshake) {
+        this.failPendingSubs("auth_timeout", "connection_ack not received");
+      }
       // Reconnect only if we still have live subs.
       if (this.subs.size === 0) return;
       this.scheduleReconnect();
@@ -279,6 +319,43 @@ export class ReactiveWebSocket {
     }
   }
 
+  private armAckTimer(): void {
+    this.clearAckTimer();
+    this.ackTimer = setTimeout(() => {
+      this.ackTimer = null;
+      if (this.ackReceived || this.closed) return;
+      this.failPendingSubs("auth_timeout", "connection_ack not received within timeout");
+      // Drop the socket so the close handler triggers reconnect logic.
+      const sock = this.socket;
+      this.socket = null;
+      if (sock != null) {
+        try {
+          sock.close(4000, "ack_timeout");
+        } catch {
+          // ignore
+        }
+      }
+    }, activeAckTimeoutMs);
+  }
+
+  private clearAckTimer(): void {
+    if (this.ackTimer != null) {
+      clearTimeout(this.ackTimer);
+      this.ackTimer = null;
+    }
+  }
+
+  private failPendingSubs(code: string, message: string): void {
+    for (const sub of this.subs.values()) {
+      if (sub.closed) continue;
+      try {
+        sub.onError({ code, message });
+      } catch (err) {
+        this.options.log?.("onError handler threw", err);
+      }
+    }
+  }
+
   private scheduleReconnect(): void {
     if (this.closed) return;
     if (this.reconnectTimer != null) return;
@@ -293,11 +370,18 @@ export class ReactiveWebSocket {
   private sendSubscribe(sub: PendingSub): void {
     if (sub.closed) return;
     this.safeSend({
-      op: "subscribe",
+      op: "subscribe-function",
       subId: sub.subId,
+      projectId: this.options.projectId,
       ref: sub.ref,
       args: sub.args,
     });
+  }
+
+  private replayPendingSubscribes(): void {
+    for (const sub of this.subs.values()) {
+      if (!sub.closed) this.sendSubscribe(sub);
+    }
   }
 
   private safeSend(payload: unknown): void {
@@ -313,26 +397,38 @@ export class ReactiveWebSocket {
 
   private handleMessage(raw: string | null): void {
     if (raw == null) return;
-    let msg: { op?: string; subId?: string; data?: unknown; code?: string; message?: string };
+    let msg: {
+      op?: string;
+      type?: string;
+      subId?: string;
+      data?: unknown;
+      code?: string;
+      message?: string;
+    };
     try {
       msg = JSON.parse(raw);
     } catch {
       this.options.log?.("ws non-JSON frame ignored");
       return;
     }
+    // graphql's collection-sub protocol uses `type:` for connection_ack and
+    // legacy `next/error/complete`. Function-sub protocol uses `op:` for
+    // function-result / function-error. Both share the same socket.
+    if (msg.type === "connection_ack") {
+      this.ackReceived = true;
+      this.clearAckTimer();
+      this.replayPendingSubscribes();
+      return;
+    }
     switch (msg.op) {
-      case "ping": {
-        this.safeSend({ op: "pong" });
-        return;
-      }
-      case "result": {
+      case "function-result": {
         if (msg.subId == null) return;
         const sub = this.subs.get(msg.subId);
         if (sub == null || sub.closed) return;
         sub.onUpdate(msg.data);
         return;
       }
-      case "error": {
+      case "function-error": {
         if (msg.subId == null) return;
         const sub = this.subs.get(msg.subId);
         if (sub == null || sub.closed) return;
@@ -349,12 +445,6 @@ export class ReactiveWebSocket {
 }
 
 // ---------- helpers ----------
-
-function appendTokenQuery(url: string, token: string): string {
-  if (token === "") return url;
-  const separator = url.includes("?") ? "&" : "?";
-  return `${url}${separator}token=${encodeURIComponent(token)}`;
-}
 
 function attachListener(sock: WSLike, event: string, listener: (arg: unknown) => void): void {
   if (typeof sock.on === "function") {
@@ -375,11 +465,6 @@ function attachListener(sock: WSLike, event: string, listener: (arg: unknown) =>
 /** Test hook — exposes the message-data extractor for unit-level coverage. */
 export function __extractMessageDataForTest(ev: unknown): string | null {
   return extractMessageData(ev);
-}
-
-/** Test hook — exposes the token URL builder for unit-level coverage. */
-export function __appendTokenQueryForTest(url: string, token: string): string {
-  return appendTokenQuery(url, token);
 }
 
 function extractMessageData(ev: unknown): string | null {

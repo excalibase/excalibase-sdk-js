@@ -2,6 +2,51 @@
 
 All notable changes to `@excalibase/sdk`.
 
+## 0.5.0 — 2026-05-12
+
+### BREAKING
+
+- **`db.functions.<m>.<n>().watch()` now connects to the graphql server's
+  `/api/v1/realtime` WebSocket** (was a Deno-runtime sibling port). One WS
+  per `db` client is multiplexed across function-level subscriptions and
+  collection-level CDC subscriptions on the same endpoint.
+- **Wire protocol change.** Before sending any subscribe frames, the SDK
+  performs a GraphQL-WS-style auth handshake:
+  - Client → Server: `{"type":"connection_init","payload":{"Authorization":"Bearer <jwt>"}}`
+  - Server → Client: `{"type":"connection_ack"}`
+  If no ack arrives within 5 s (or the server closes before ack), every
+  pending subscription receives `SubError({code:"auth_timeout"})`.
+- **Frame op-names renamed:**
+  - `{op:"subscribe", ...}` → `{op:"subscribe-function", subId, projectId, ref, args}`
+  - `{op:"unsubscribe", ...}` → `{op:"unsubscribe-function", subId}`
+  - `{op:"result", ...}` → `{op:"function-result", subId, data, pageStatus?}`
+  - `{op:"error", ...}` → `{op:"function-error", subId, code, message}`
+- **No more `?token=<jwt>` query param.** The JWT is sent in the
+  `connection_init` payload instead.
+- **No more application-level `ping`/`pong` frames.** graphql uses native
+  WebSocket ping/pong, which browsers and the `ws` library handle
+  transparently.
+- **`wsUrl` format changed.** Old format pointed at a Deno sibling port:
+  `ws://localhost:<wsPort>/functions/v1/{projectId}/_watch`. New format:
+  `ws://<graphql-host>/api/v1/realtime`.
+
+### Migration
+
+```diff
+ const db = createClient({
+   url: "http://localhost:10000",
+   projectId: "acme/prod",
+   publishableKey: "esk_pub_live_...",
+-  wsUrl: "ws://localhost:10001/functions/v1/acme/prod/_watch",
++  wsUrl: "ws://localhost:10000/api/v1/realtime",
+ });
+```
+
+No call-site changes are required — `db.functions.x.y(args).watch()` works
+exactly the same. The protocol change is internal to the SDK. Users who
+upgrade the SDK without updating `wsUrl` will see `auth_timeout` errors
+because the old Deno sibling port does not understand `connection_init`.
+
 ## 0.4.0 — 2026-05-12
 
 ### BREAKING

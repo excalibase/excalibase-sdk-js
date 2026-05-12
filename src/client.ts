@@ -62,7 +62,10 @@ export class DbClient<
   readonly storage: StorageAdapter;
   readonly storageKey: string;
   readonly schema: SchemaMeta | undefined;
-  /** WebSocket URL for `.watch()` (Phase 9b.C); undefined disables reactive. */
+  /**
+   * WebSocket URL for `.watch()` reactive subscriptions. Points at graphql's
+   * `/api/v1/realtime` endpoint; undefined disables reactive entirely.
+   */
   readonly wsUrl: string | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly extraHeaders: Record<string, string>;

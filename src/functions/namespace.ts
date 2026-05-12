@@ -210,6 +210,7 @@ export class FunctionsNamespace<F = unknown> {
     if (this._reactive == null) {
       this._reactive = new ReactiveWebSocket({
         url: this.wsUrl,
+        projectId: this.projectId,
         jwtProvider: this.jwtProvider ?? (() => ""),
       });
     }

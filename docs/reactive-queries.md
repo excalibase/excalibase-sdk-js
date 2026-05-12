@@ -84,8 +84,10 @@ const db = createClient({
   url: "http://localhost:10000",
   projectId: "acme/prod",
   publishableKey: "esk_pub_live_...",
-  // NEW: required for `.watch()`. Omit it to disable reactive.
-  wsUrl: "ws://localhost:10001/functions/v1/acme/prod/_watch",
+  // NEW (Phase 15c): points at graphql's `/api/v1/realtime` WebSocket.
+  // Multiplexed with collection-level CDC subscriptions over one socket.
+  // Required for `.watch()`. Omit it to disable reactive.
+  wsUrl: "ws://localhost:10000/api/v1/realtime",
 });
 
 // One-shot (unchanged from Phase 2)
@@ -127,11 +129,12 @@ interface SubError {
 
 ### `createClient({ wsUrl })`
 
-`wsUrl` is the WS endpoint of the function runtime's reactive sibling port.
-Format:
+`wsUrl` is the WS endpoint of the graphql server's realtime handler — the
+same path that already powers collection-level CDC subscriptions. Function
+subscriptions multiplex on top of the same socket.
 
 ```
-ws(s)://<host>:<wsPort>/functions/v1/{orgSlug}/{projectName}/_watch
+ws(s)://<graphql-host>/api/v1/realtime
 ```
 
 When `wsUrl` is omitted, calling `.watch()` throws a clear error. `await`
@@ -139,24 +142,42 @@ calls still work without `wsUrl`.
 
 ## Wire protocol
 
-The SDK speaks the `excalibase-fn-v1` subprotocol on the WebSocket. The JWT
-is passed as a `?token=<jwt>` query parameter (browser `new WebSocket(...)`
-cannot set HTTP headers, so query param is the only portable carrier).
+The SDK opens a plain WebSocket to graphql's `/api/v1/realtime` endpoint (no
+custom subprotocol). Authentication follows the GraphQL-WS convention used by
+the collection-subscription protocol that already lives on the same endpoint.
+
+### Auth handshake
+
+1. Client opens the WebSocket.
+2. Client sends:
+   ```json
+   {"type":"connection_init","payload":{"Authorization":"Bearer <jwt>"}}
+   ```
+3. Server replies:
+   ```json
+   {"type":"connection_ack"}
+   ```
+4. Once the ack lands, the client may send `subscribe-function` frames.
+   If no ack arrives within 5 s (or the server closes mid-handshake) every
+   pending sub receives `SubError({code:"auth_timeout"})`.
+
+### Frames (post-ack)
 
 Frames are JSON.
 
 | Direction | Frame |
 |-----------|-------|
-| Client → Server | `{op:"subscribe",subId,ref:{moduleName,exportName},args}` |
-| Client → Server | `{op:"unsubscribe",subId}` |
-| Client → Server | `{op:"pong"}` |
-| Server → Client | `{op:"result",subId,data,pageStatus?}` |
-| Server → Client | `{op:"error",subId,code,message}` |
-| Server → Client | `{op:"ping"}` |
+| Client → Server | `{op:"subscribe-function",subId,projectId,ref:{moduleName,exportName},args}` |
+| Client → Server | `{op:"unsubscribe-function",subId}` |
+| Server → Client | `{op:"function-result",subId,data,pageStatus?}` |
+| Server → Client | `{op:"function-error",subId,code,message}` |
 
 The `pageStatus` field (`"SplitRecommended"` / `"SplitRequired"` / `null`) is
 passed through to the subscription handler as part of `data`. The SDK does
 not interpret it — surface it to your UI for pagination hints.
+
+Server-emitted `code` values from graphql 15a: `bad_request`, `unauthenticated`,
+`functions_disabled`, `invoke_failed_status_<N>`, `invoke_transport_error`.
 
 ## Connection lifecycle
 
@@ -165,12 +186,14 @@ not interpret it — surface it to your UI for pagination hints.
   `.watch()` and stays alive until explicitly closed.
 - **Reconnect.** On unexpected disconnect, the client reconnects with
   exponential backoff: `1s, 2s, 4s, 8s, 16s, 30s, 30s, …` (jittered ±20%).
-  All pending subscriptions are replayed on the new socket.
+  On every (re)connect the SDK sends a fresh `connection_init` and waits
+  for `connection_ack` before replaying pending `subscribe-function` frames.
 - **JWT refresh.** The current session's access token is read on every
   (re)connect attempt — so a refreshed JWT takes effect on next reconnect.
-- **Server pings.** The server pings every 30 s; the SDK replies with pong.
-  If the SDK doesn't pong in 90 s the server closes (code 1008). The SDK
-  then reconnects per the backoff curve.
+- **Heartbeat.** Native WebSocket ping/pong frames. The graphql server uses
+  the built-in TCP-level ping/pong of the WebSocket protocol (browser and
+  `ws` library handle these transparently); the SDK does not implement an
+  application-level heartbeat.
 - **Close.** Call `db.functions_closeReactive()` on app teardown to send
   unsubscribes for every live sub and close the socket cleanly.
 
