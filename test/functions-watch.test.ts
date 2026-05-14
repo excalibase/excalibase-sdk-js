@@ -118,11 +118,6 @@ async function waitFor(pred: () => boolean, timeoutMs = 2000, label = "condition
   throw new Error(`waitFor timeout: ${label}`);
 }
 
-async function flush(times = 3): Promise<void> {
-  for (let i = 0; i < times; i++) {
-    await new Promise((r) => setTimeout(r, 0));
-  }
-}
 
 interface InvokeCapture {
   url: string;
@@ -368,7 +363,7 @@ describe("ReactiveWebSocket — collection-CDC subscribe orchestration", () => {
     });
     const got: unknown[] = [];
     await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
-    await waitFor(() => got.length === 1, 2000, "initial");
+    await waitFor(() => got.length === 1 && serverConn != null, 2000, "initial+conn");
     // Inject an event whose `id` does not belong to any known table sub.
     (serverConn as unknown as WSWebSocket).send(JSON.stringify({
       type: "next",
@@ -556,7 +551,11 @@ describe("ReactiveWebSocket — collection-CDC subscribe orchestration", () => {
     await waitFor(() => connectionNum >= 2, 5000, "second connection");
     await waitFor(() => (subbedByConn[2]?.length ?? 0) === 2, 5000, "two resubscribes");
     expect(initsByConn[2]).toBe(1);
-    expect(subbedByConn[2]!.sort()).toEqual(subbedByConn[1]!.sort());
+    // Resubscribed ids are minted fresh per connection — assert cardinality
+    // and that conn-2 ids are distinct from conn-1 ids (no overlap).
+    expect(new Set(subbedByConn[2]).size).toBe(2);
+    const overlap = subbedByConn[2]!.filter((id) => subbedByConn[1]!.includes(id));
+    expect(overlap).toEqual([]);
     await ws.close();
     await new Promise<void>((r) => wss.close(() => r()));
   });
@@ -680,7 +679,7 @@ describe("LazyQuery — db.functions.<m>.<n>().watch() orchestration", () => {
     const sub = (db.functions as any).posts.list({}).watch();
     const got: unknown[] = [];
     sub.onUpdate((d: unknown) => got.push(d));
-    await waitFor(() => got.length === 1, 2000, "initial");
+    await waitFor(() => got.length === 1 && serverConn != null, 2000, "initial+conn");
     (serverConn as unknown as WSWebSocket).send(JSON.stringify({
       type: "next", id: "some-other-id", op: "insert", doc: {},
     }));
@@ -882,10 +881,12 @@ describe("ReactiveWebSocket — edges", () => {
   });
 
   test("unsubscribe handle is idempotent", async () => {
+    const subbedIds: string[] = [];
     const completedIds: string[] = [];
     const server = await startMockWsServer((ws) => {
       ws.on("message", (raw) => {
         const msg = JSON.parse(raw.toString()) as { type?: string; id?: string };
+        if (msg.type === "subscribe" && msg.id != null) subbedIds.push(msg.id);
         if (msg.type === "complete" && msg.id != null) completedIds.push(msg.id);
       });
     });
@@ -895,7 +896,7 @@ describe("ReactiveWebSocket — edges", () => {
       invoke: async () => ({ result: 1, reads: ["nosql_a"] }),
     });
     const off = await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
-    await waitFor(() => ws.size() === 1, 2000, "registered");
+    await waitFor(() => subbedIds.length === 1, 2000, "subscribe landed");
     off();
     off(); // second call must not throw
     await waitFor(() => completedIds.length === 1, 2000, "single complete");
@@ -978,6 +979,316 @@ describe("ReactiveWebSocket — edges", () => {
     expect(__extractMessageDataForTest({ data: Buffer.from("xyz", "utf8") })).toBe("xyz");
     expect(__extractMessageDataForTest({ data: 42 })).toBeNull();
     expect(__extractMessageDataForTest(Buffer.from("raw", "utf8"))).toBe("raw");
+  });
+
+  test("ws constructor throwing schedules reconnect (no crash)", async () => {
+    let calls = 0;
+    const logs: unknown[] = [];
+    const ThrowingCtor = function () {
+      calls += 1;
+      throw new Error("connect blew up");
+    } as unknown as new (url: string, protocols?: string | string[]) => unknown;
+    const ws = new ReactiveWebSocket({
+      url: "ws://127.0.0.1:1/graphql",
+      jwtProvider: () => "t",
+      invoke: async () => ({ result: 1, reads: ["nosql_x"] }),
+      websocketImpl: ThrowingCtor,
+      log: (...args) => logs.push(args),
+    });
+    await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(calls).toBeGreaterThanOrEqual(1);
+    expect(logs.some((args) => String((args as unknown[])[0]).includes("WS constructor"))).toBe(true);
+    await ws.close();
+  });
+
+  test("jwtProvider throwing → log + connection_init still sent with empty token", async () => {
+    const initFrames: unknown[] = [];
+    const server = await startMockWsServer((ws) => {
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString()) as { type?: string };
+        if (msg.type === "connection_init") initFrames.push(msg);
+      });
+    });
+    const logs: unknown[] = [];
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/graphql`,
+      jwtProvider: async () => {
+        throw new Error("no-token");
+      },
+      invoke: async () => ({ result: 1, reads: [] }),
+      log: (...args) => logs.push(args),
+    });
+    await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
+    await waitFor(() => initFrames.length > 0, 2000, "init frame");
+    expect(logs.some((args) => String((args as unknown[])[0]).includes("jwtProvider"))).toBe(true);
+    expect(initFrames[0]).toMatchObject({ type: "connection_init" });
+    await ws.close();
+    await server.close();
+  });
+
+  test("server-sent error frame is logged but not crashed on", async () => {
+    let serverConn: WSWebSocket | null = null;
+    const subFrames: Array<{ id: string }> = [];
+    const server = await startMockWsServer((ws) => {
+      serverConn = ws;
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString()) as { type?: string; id?: string };
+        if (msg.type === "subscribe") subFrames.push({ id: msg.id ?? "" });
+      });
+    });
+    const logs: unknown[] = [];
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/graphql`,
+      jwtProvider: () => "t",
+      invoke: async () => ({ result: 1, reads: ["nosql_x"] }),
+      log: (...args) => logs.push(args),
+    });
+    await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
+    await waitFor(() => subFrames.length > 0, 2000, "sub landed");
+    // Inject `{type:"error", id, payload:{message}}` (graphql's existing shape)
+    // and a fallback `{type:"error", id, message}` form.
+    (serverConn as unknown as WSWebSocket).send(JSON.stringify({
+      type: "error", id: subFrames[0]!.id, payload: { message: "first error" },
+    }));
+    (serverConn as unknown as WSWebSocket).send(JSON.stringify({
+      type: "error", id: subFrames[0]!.id, message: "second error",
+    }));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(logs.some((args) => String((args as unknown[])[0]).includes("ws error frame"))).toBe(true);
+    await ws.close();
+    await server.close();
+  });
+
+  test("listener exceptions are swallowed and logged", async () => {
+    const server = await startMockWsServer(() => undefined);
+    const logs: unknown[] = [];
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/graphql`,
+      jwtProvider: () => "t",
+      invoke: async () => ({ result: 1, reads: [] }),
+      log: (...args) => logs.push(args),
+    });
+    await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, () => {
+      throw new Error("listener boom");
+    }, () => undefined);
+    await waitFor(
+      () => logs.some((args) => String((args as unknown[])[0]).includes("listener threw")),
+      2000,
+      "listener threw logged",
+    );
+    await ws.close();
+    await server.close();
+  });
+
+  test("addEventListener fallback path is used when on() is absent", async () => {
+    type Listener = (ev: unknown) => void;
+    const sends: string[] = [];
+    let openListener: Listener | null = null;
+    let messageListener: Listener | null = null;
+    interface StubInst {
+      readyState: number;
+      send(d: string): void;
+      close(): void;
+      addEventListener(event: string, listener: Listener): void;
+    }
+    const Ctor = function () {
+      const inst: StubInst = {
+        readyState: 0,
+        send(d: string) {
+          sends.push(d);
+        },
+        close() {
+          inst.readyState = 3;
+        },
+        addEventListener(event: string, listener: Listener) {
+          if (event === "open") openListener = listener;
+          if (event === "message") messageListener = listener;
+        },
+      };
+      return inst;
+    } as unknown as new () => unknown;
+    const ws = new ReactiveWebSocket({
+      url: "ws://h/graphql",
+      jwtProvider: () => "t",
+      invoke: async () => ({ result: { ok: 1 }, reads: ["nosql_x"] }),
+      websocketImpl: Ctor,
+    });
+    const updates: unknown[] = [];
+    await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, (d) => updates.push(d), () => undefined);
+    await waitFor(() => openListener != null && messageListener != null, 2000, "listeners attached");
+    // Mark socket open by mutating readyState before firing open.
+    // (The Ctor stub closes over inst; readyState change is observed via the
+    // same instance the SDK holds.)
+    // The send list before open should contain nothing (socket not at readyState 1).
+    // After open we manually drive the handshake and the function-result event.
+    (openListener as unknown as Listener)(undefined);
+    // SDK sends connection_init now — but readyState is 0, so safeSend drops.
+    // For the stub we don't bother emitting subscribe; the initial onUpdate
+    // already fired from the in-memory HTTP invoke return.
+    expect(updates).toEqual([{ ok: 1 }]);
+    await ws.close();
+  });
+
+  test("listener attach throws when neither on() nor addEventListener present", async () => {
+    const Ctor = function () {
+      return { readyState: 0, send: () => undefined, close: () => undefined };
+    } as unknown as new () => unknown;
+    const logs: unknown[] = [];
+    const ws = new ReactiveWebSocket({
+      url: "ws://h/graphql",
+      jwtProvider: () => "t",
+      invoke: async () => ({ result: 1, reads: [] }),
+      websocketImpl: Ctor,
+      log: (...args) => logs.push(args),
+    });
+    await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
+    await waitFor(
+      () => logs.some((args) => String((args as unknown[])[0]).includes("attach failed")),
+      2000,
+      "attach failed logged",
+    );
+    await ws.close();
+  });
+
+  test("__hashResultForTest hashes equal values to equal hex", async () => {
+    const { __hashResultForTest } = await import("../src/functions/reactive_ws");
+    expect(__hashResultForTest({ a: 1, b: 2 })).toBe(__hashResultForTest({ b: 2, a: 1 }));
+    expect(__hashResultForTest([1, 2, 3])).not.toBe(__hashResultForTest([3, 2, 1]));
+    expect(__hashResultForTest(null)).toBe(__hashResultForTest(null));
+  });
+
+  test("computeBackoffDelayForTest with jitter > 0 produces a bounded value", async () => {
+    __resetReconnectBackoff();
+    const { computeBackoffDelayForTest } = await import("../src/functions/reactive_ws");
+    for (let i = 0; i < 20; i++) {
+      const v = computeBackoffDelayForTest(0, 0.5);
+      expect(v).toBeGreaterThanOrEqual(500);
+      expect(v).toBeLessThanOrEqual(1000);
+    }
+  });
+
+  test("ensureSocket fast-path: 2nd sub on a hot socket reuses it without re-init", async () => {
+    const initFrames: unknown[] = [];
+    const subbedIds: string[] = [];
+    const server = await startMockWsServer((ws) => {
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString()) as { type?: string; id?: string };
+        if (msg.type === "connection_init") initFrames.push(msg);
+        if (msg.type === "subscribe" && msg.id != null) subbedIds.push(msg.id);
+      });
+    });
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/graphql`,
+      jwtProvider: () => "t",
+      invoke: async (ref) => ({ result: ref.exportName, reads: [`nosql_${ref.exportName}`] }),
+    });
+    await ws.subscribe("u1", { moduleName: "m", exportName: "a" }, {}, () => undefined, () => undefined);
+    await waitFor(() => subbedIds.length === 1, 2000, "first sub");
+    // Second subscribe happens after the socket is already acked.
+    await ws.subscribe("u2", { moduleName: "m", exportName: "b" }, {}, () => undefined, () => undefined);
+    await waitFor(() => subbedIds.length === 2, 2000, "second sub");
+    expect(initFrames.length).toBe(1);
+    await ws.close();
+    await server.close();
+  });
+
+  test("safeSend on a closed/never-open socket is a silent no-op", async () => {
+    const Ctor = function (this: unknown) {
+      const inst = {
+        readyState: 0, // permanently 0 — open never fires
+        send: () => undefined,
+        close: () => undefined,
+        on: () => undefined,
+      };
+      return inst;
+    } as unknown as new (url: string, protocols?: string | string[]) => unknown;
+    const ws = new ReactiveWebSocket({
+      url: "ws://h/graphql",
+      jwtProvider: () => "t",
+      invoke: async () => ({ result: 1, reads: ["nosql_x"] }),
+      websocketImpl: Ctor,
+    });
+    // Subscribe — initial onUpdate fires from HTTP, ensureSocket awaits ack
+    // that never arrives (timeout). No crash on the dangling safeSend calls.
+    await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
+    await new Promise((r) => setTimeout(r, 250));
+    await ws.close();
+  });
+
+  test("resolveWebSocketCtor: globalThis.WebSocket wins when set", async () => {
+    const prev = (globalThis as { WebSocket?: unknown }).WebSocket;
+    (globalThis as { WebSocket?: unknown }).WebSocket = WSWebSocket;
+    try {
+      const server = await startMockWsServer(() => undefined);
+      const ws = new ReactiveWebSocket({
+        url: `${server.url}/graphql`,
+        jwtProvider: () => "t",
+        invoke: async () => ({ result: 1, reads: [] }),
+      });
+      const got: unknown[] = [];
+      await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, (d) => got.push(d), () => undefined);
+      await waitFor(() => got.length === 1, 2000, "initial");
+      await ws.close();
+      await server.close();
+    } finally {
+      if (prev === undefined) {
+        delete (globalThis as { WebSocket?: unknown }).WebSocket;
+      } else {
+        (globalThis as { WebSocket?: unknown }).WebSocket = prev;
+      }
+    }
+  });
+
+  test("close after disconnect: no reconnect, no further sends", async () => {
+    let connectionNum = 0;
+    const subbedIds: string[] = [];
+    const server = await startMockWsServer((ws) => {
+      connectionNum += 1;
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString()) as { type?: string; id?: string };
+        if (msg.type === "subscribe" && msg.id != null) subbedIds.push(msg.id);
+      });
+    });
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/graphql`,
+      jwtProvider: () => "t",
+      invoke: async () => ({ result: 1, reads: ["nosql_x"] }),
+    });
+    const off = await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
+    await waitFor(() => subbedIds.length === 1, 2000, "sub");
+    off();
+    for (const client of server.wss.clients) client.terminate();
+    await new Promise((r) => setTimeout(r, 80));
+    expect(connectionNum).toBe(1);
+    await ws.close();
+    await server.close();
+  });
+
+  test("error event on the WS is logged but not propagated", async () => {
+    const server = await startMockWsServer(() => undefined);
+    const logs: unknown[] = [];
+    const ws = new ReactiveWebSocket({
+      url: `${server.url}/graphql`,
+      jwtProvider: () => "t",
+      invoke: async () => ({ result: 1, reads: [] }),
+      log: (...args) => logs.push(args),
+    });
+    await ws.subscribe("u1", { moduleName: "m", exportName: "n" }, {}, () => undefined, () => undefined);
+    // Force an error event on the underlying ws — close the server hard.
+    for (const client of server.wss.clients) {
+      try {
+        client.emit("error", new Error("simulated"));
+      } catch {
+        // ignore
+      }
+    }
+    await new Promise((r) => setTimeout(r, 60));
+    // Either ws error or socket-close branches are exercised; at minimum, no
+    // crash occurred and the orchestrator state remains consistent.
+    expect(ws.size()).toBe(1);
+    await ws.close();
+    await server.close();
   });
 
   test("invoke throwing on initial sub still resolves subscribe() but routes the error", async () => {

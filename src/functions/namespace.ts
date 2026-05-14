@@ -1,66 +1,54 @@
 /**
- * Phase 2 + 9b.C: `db.functions.<module>.<name>(args)` typed RPC namespace.
+ * `db.functions.<module>.<name>(args)` — typed HTTP RPC namespace plus a
+ * `.watch()` orchestrator for reactive subscriptions.
  *
- * Runtime structure: a two-level `Proxy` wraps a {@link FunctionsNamespace}
- * instance. Top-level property access yields a "module" handle whose own
- * property access produces a callable function ref.
- *
- * As of Phase 9b.C, each call returns a {@link LazyQuery} — a Promise-like
- * object that is BOTH:
- *   - thenable (await resolves to the one-shot HTTP result; Phase 2 behavior)
- *   - `.watch()`-able (opens a WS subscription for push updates; Phase 9b.C)
+ * Each call returns a {@link LazyQuery} — a Promise-like object that is BOTH:
+ *   - thenable (await resolves to the one-shot HTTP result; unchanged)
+ *   - `.watch()`-able (orchestrates reactive updates by listening on graphql's
+ *     collection-CDC WebSocket and re-invoking the function whenever a
+ *     dependency table fires an event)
  *
  * The HTTP path POSTs to
  *   ${url}/functions/v1/${projectId}/${moduleName}.${exportName}
- * with `{ args }` as JSON. Response `{ data }` is unwrapped; `{ error, issues? }`
- * throws {@link FunctionsError}. The WS path is implemented by
- * {@link ReactiveWebSocket}; the namespace owns one WS per `db` client and
- * multiplexes all watch subscriptions.
+ * with `{ args }` as JSON.
+ *
+ * `await` calls do NOT request the envelope (back-compat unwrap of `{data}`).
+ * `.watch()` calls add `X-Excalibase-Envelope: v1` so the server returns
+ * `{result, reads}` and the orchestrator can subscribe to the right tables.
  */
 
 import { FunctionsError, type ValidationIssue } from "./error";
-import { ReactiveWebSocket, type SubError } from "./reactive_ws";
+import { ReactiveWebSocket, type SubError, type FunctionRefMsg } from "./reactive_ws";
 
 export interface FunctionsNamespaceOptions {
   /** Server base URL — no trailing slash. */
   url: string;
-  /** `{orgSlug}/{projectName}` — appended to the function URL path. */
+  /** `{orgSlug}/{projectName}` or opaque id — appended to the function URL path. */
   projectId: string;
   /** Returns headers for each call (so Authorization can be re-read). */
   headersFactory: () => Record<string, string>;
   /** Bound `fetch` (defaults to `globalThis.fetch` if absent). */
   fetchImpl: typeof fetch;
   /**
-   * Optional WS endpoint for `.watch()` subscriptions. Required for reactive
-   * subscriptions; calling `.watch()` without it throws a clear error.
+   * WS endpoint for `.watch()` subscriptions — graphql's `/graphql` endpoint
+   * (the same one used for collection-level CDC subscriptions). Required for
+   * reactive subscriptions; calling `.watch()` without it throws.
    */
   wsUrl?: string;
-  /** Returns the current JWT bearer token for WS auth (query param `token`). */
+  /** Returns the current JWT bearer token for the WS connection_init. */
   jwtProvider?: () => Promise<string> | string;
 }
 
-/** A reactive subscription handle. */
 export interface Subscription<T = unknown> {
-  /** Register an update listener. Returns an unsubscribe function. */
   onUpdate(handler: (data: T) => void): () => void;
-  /** Register an error listener. Returns an unsubscribe function. */
   onError(handler: (err: SubError) => void): () => void;
-  /** Stop the subscription server-side and tear down listeners. */
   close(): void;
 }
 
-/**
- * Returned from `db.functions.<m>.<n>(args)`. Either:
- *   - `await` it → one-shot HTTP result
- *   - call `.watch()` → reactive WebSocket subscription
- */
 export interface LazyQuery<T = unknown> extends Promise<T> {
   watch(): Subscription<T>;
 }
 
-// Reserved at the top-level Proxy to avoid synthesizing module handles for
-// internal members. `_invoke`, `_closeReactive`, `_reactive` etc are own
-// methods on the FunctionsNamespace instance and must pass through.
 const RESERVED_TOP_KEYS = new Set<PropertyKey>([
   "then",
   "catch",
@@ -73,8 +61,13 @@ const RESERVED_TOP_KEYS = new Set<PropertyKey>([
   Symbol.toPrimitive,
   Symbol.toStringTag,
   "_invoke",
+  "_invokeWithEnvelope",
+  "_postFunction",
   "_closeReactive",
   "_reactive",
+  "_ensureReactive",
+  "_openSubscription",
+  "_subIdCounter",
   "_nextSubId",
   "url",
   "projectId",
@@ -98,12 +91,6 @@ function makeModuleHandle(ns: FunctionsNamespace<any>, moduleName: string): Reco
   });
 }
 
-/**
- * Builds a thenable that is also `.watch()`-able. The `then/catch/finally`
- * implementations defer to a lazily-constructed HTTP Promise (created on
- * first `then`). `.watch()` opens a WS subscription via the namespace's
- * shared {@link ReactiveWebSocket}.
- */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function makeLazyQuery(ns: FunctionsNamespace<any>, moduleName: string, exportName: string, args: unknown): LazyQuery<unknown> {
   let httpPromise: Promise<unknown> | null = null;
@@ -125,8 +112,6 @@ function makeLazyQuery(ns: FunctionsNamespace<any>, moduleName: string, exportNa
       return ns._openSubscription(moduleName, exportName, args);
     },
   };
-  // Tag for Promise.resolve detection — not strictly required, but cleaner
-  // for libraries that sniff `Symbol.toStringTag`.
   Object.defineProperty(lazy, Symbol.toStringTag, { value: "LazyQuery" });
   return lazy as LazyQuery<unknown>;
 }
@@ -148,22 +133,67 @@ export class FunctionsNamespace<F = unknown> {
     this.fetchImpl = opts.fetchImpl;
     this.wsUrl = opts.wsUrl;
     this.jwtProvider = opts.jwtProvider;
-    // eslint-disable-next-line @typescript-eslint/no-this-alias
-    const self = this;
     return new Proxy(this, {
       get(target, prop, receiver): unknown {
         if (RESERVED_TOP_KEYS.has(prop)) return Reflect.get(target, prop, receiver);
         if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
-        return makeModuleHandle(self, String(prop));
+        return makeModuleHandle(target, String(prop));
       },
     }) as unknown as FunctionsNamespace<F> & F;
   }
 
+  /**
+   * Plain HTTP invoke — no envelope header. Response `{data}` is unwrapped
+   * for back-compat. Used by `await db.functions.x.y(args)`.
+   */
   async _invoke(moduleName: string, exportName: string, args: unknown): Promise<unknown> {
+    const text = await this._postFunction(moduleName, exportName, args, {});
+    return text.parsed != null && typeof text.parsed === "object" && "data" in (text.parsed as Record<string, unknown>)
+      ? (text.parsed as { data: unknown }).data
+      : text.parsed;
+  }
+
+  /**
+   * Envelope-aware invoke — sets `X-Excalibase-Envelope: v1` so the server
+   * returns `{result, reads}`. Used by the reactive orchestrator on initial
+   * subscribe and every CDC-triggered re-invoke.
+   */
+  async _invokeWithEnvelope(
+    moduleName: string,
+    exportName: string,
+    args: unknown,
+  ): Promise<{ result: unknown; reads: readonly string[] }> {
+    const text = await this._postFunction(moduleName, exportName, args, {
+      "X-Excalibase-Envelope": "v1",
+    });
+    const parsed = text.parsed;
+    if (parsed != null && typeof parsed === "object") {
+      const obj = parsed as Record<string, unknown>;
+      if ("result" in obj || "reads" in obj) {
+        const reads = Array.isArray(obj.reads)
+          ? (obj.reads as unknown[]).filter((v) => typeof v === "string") as string[]
+          : [];
+        return { result: obj.result, reads };
+      }
+      // Server hasn't yet learned the envelope header — fall back to {data}.
+      if ("data" in obj) {
+        return { result: obj.data, reads: [] };
+      }
+    }
+    return { result: parsed, reads: [] };
+  }
+
+  private async _postFunction(
+    moduleName: string,
+    exportName: string,
+    args: unknown,
+    extraHeaders: Record<string, string>,
+  ): Promise<{ parsed: unknown; status: number }> {
     const url = `${this.url}/functions/v1/${this.projectId}/${moduleName}.${exportName}`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...this.headersFactory(),
+      ...extraHeaders,
     };
     let response: Response;
     try {
@@ -180,7 +210,6 @@ export class FunctionsNamespace<F = unknown> {
     }
     const text = await response.text();
     const parsed = text.length > 0 ? safeJsonParse(text) : null;
-
     if (!response.ok) {
       const message = extractErrorMessage(parsed) ?? `functions ${moduleName}.${exportName} failed with ${response.status}`;
       const issues = extractIssues(parsed);
@@ -190,16 +219,9 @@ export class FunctionsNamespace<F = unknown> {
         issues,
       });
     }
-    if (parsed != null && typeof parsed === "object" && "data" in (parsed as Record<string, unknown>)) {
-      return (parsed as { data: unknown }).data;
-    }
-    return parsed;
+    return { parsed, status: response.status };
   }
 
-  /**
-   * Open a `.watch()` subscription. Creates the shared {@link ReactiveWebSocket}
-   * on first call. Throws when `wsUrl` was not configured.
-   */
   _openSubscription(moduleName: string, exportName: string, args: unknown): Subscription<unknown> {
     if (this.wsUrl == null || this.wsUrl.length === 0) {
       throw new Error(
@@ -207,33 +229,30 @@ export class FunctionsNamespace<F = unknown> {
           "See docs/reactive-queries.md.",
       );
     }
-    if (this._reactive == null) {
-      this._reactive = new ReactiveWebSocket({
-        url: this.wsUrl,
-        projectId: this.projectId,
-        jwtProvider: this.jwtProvider ?? (() => ""),
-      });
-    }
+    const reactive = this._ensureReactive();
     const subId = this._nextSubId();
     const updateListeners = new Set<(d: unknown) => void>();
     const errorListeners = new Set<(e: SubError) => void>();
-    let unsub: (() => void) | null = null;
-    const reactive = this._reactive;
-    const start = (): void => {
-      unsub = reactive.subscribe(
-        subId,
-        { moduleName, exportName },
-        args,
-        (data) => {
-          for (const fn of updateListeners) fn(data);
-        },
-        (err) => {
-          for (const fn of errorListeners) fn(err);
-        },
-      );
-    };
-    start();
+    let teardown: (() => void) | null = null;
     let closed = false;
+    void reactive.subscribe(
+      subId,
+      { moduleName, exportName },
+      args,
+      (data) => {
+        for (const fn of updateListeners) fn(data);
+      },
+      (err) => {
+        for (const fn of errorListeners) fn(err);
+      },
+    ).then((t) => {
+      teardown = t;
+      if (closed) t();
+    }).catch((err) => {
+      for (const fn of errorListeners) {
+        fn({ code: "subscribe_failed", message: err instanceof Error ? err.message : String(err) });
+      }
+    });
     return {
       onUpdate(handler) {
         updateListeners.add(handler);
@@ -252,18 +271,27 @@ export class FunctionsNamespace<F = unknown> {
         closed = true;
         updateListeners.clear();
         errorListeners.clear();
-        if (unsub != null) unsub();
+        if (teardown != null) teardown();
       },
     };
   }
 
-  /** Close the underlying reactive WebSocket (if any) and reset. */
+  private _ensureReactive(): ReactiveWebSocket {
+    if (this._reactive != null) return this._reactive;
+    const ws = new ReactiveWebSocket({
+      url: this.wsUrl as string,
+      jwtProvider: this.jwtProvider ?? (() => ""),
+      invoke: (ref: FunctionRefMsg, args: unknown) =>
+        this._invokeWithEnvelope(ref.moduleName, ref.exportName, args),
+    });
+    this._reactive = ws;
+    return ws;
+  }
+
   async _closeReactive(): Promise<void> {
     const ws = this._reactive;
     this._reactive = null;
-    if (ws != null) {
-      await ws.close();
-    }
+    if (ws != null) await ws.close();
   }
 
   private _nextSubId(): string {

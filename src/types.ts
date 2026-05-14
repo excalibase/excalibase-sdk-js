@@ -82,9 +82,11 @@ export interface CreateClientOptions {
   schema?: SchemaMeta;
   /**
    * Optional WebSocket endpoint for reactive `db.functions.<m>.<n>().watch()`
-   * subscriptions. Points at the graphql server's realtime endpoint and is
-   * multiplexed with collection-level CDC subscriptions over one socket.
-   * Format: `ws(s)://<graphql-host>/api/v1/realtime`. When omitted, calling
+   * subscriptions. Points at graphql's `/graphql` endpoint (same path used
+   * for queries / mutations); the SDK opens it with the
+   * `graphql-transport-ws` subprotocol and multiplexes all function-level
+   * `.watch()` subscriptions over a single socket.
+   * Format: `ws(s)://<graphql-host>:<port>/graphql`. When omitted, calling
    * `.watch()` throws — `await` paths still work.
    */
   wsUrl?: string;

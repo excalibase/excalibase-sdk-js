@@ -2,6 +2,89 @@
 
 All notable changes to `@excalibase/sdk`.
 
+## 0.8.0 — 2026-05-15
+
+### BREAKING
+
+- **`.watch()` reactive subscriptions speak the collection-CDC protocol on
+  graphql's existing `/graphql` WebSocket.** The previous
+  function-subscription protocol (`{op:"subscribe-function", ...}` →
+  `{op:"function-result"}`) is gone — it never existed on the graphql side
+  in the new architecture, so any client that spoke it was broken in
+  practice. The orchestrator now lives in the SDK:
+
+  1. HTTP-invoke the function with `X-Excalibase-Envelope: v1` to receive
+     `{result, reads}`.
+  2. Open one WS per `db` client to `ws(s)://<graphql-host>/graphql` with
+     the `graphql-transport-ws` subprotocol; perform the
+     `connection_init` / `connection_ack` handshake.
+  3. Send one lightweight subscribe frame per dependency:
+     `{id, type:"subscribe", source, collection}`.
+  4. On any `{type:"next", id, op, doc}` for a watched table, re-invoke
+     the function over HTTP, SHA-256-hash the result, dedup, and fire
+     `onUpdate` only when the hash differs.
+  5. Bursts coalesce per sub: at most one invoke is in flight; a trailing
+     invoke fires once if events arrived during the running one.
+
+- **`createClient({ wsUrl })` format changed.** The previous value pointed
+  at graphql's `/api/v1/realtime` endpoint. The new value is graphql's
+  `/graphql` endpoint (same one used for queries / mutations) — both
+  function-reactive subscriptions and collection-level CDC subscriptions
+  multiplex onto a single WS over the `graphql-transport-ws` subprotocol.
+
+  ```diff
+   const db = createClient({
+     url: "http://localhost:10000",
+     projectId: "acme/prod",
+     publishableKey: "esk_pub_live_...",
+  -  wsUrl: "ws://localhost:10000/api/v1/realtime",
+  +  wsUrl: "ws://localhost:10000/graphql",
+   });
+  ```
+
+  No `.watch()` call-site changes are required. Upgrading the SDK without
+  updating `wsUrl` will surface as a `SubError({code:"auth_timeout"})`
+  because the old endpoint never sends `connection_ack` for an
+  unrecognized handshake.
+
+- **Wire protocol change (post-handshake).**
+
+  | Direction | Old frame | New frame |
+  |-----------|-----------|-----------|
+  | Client → Server | `{op:"subscribe-function", ...}` | `{id, type:"subscribe", source, collection}` |
+  | Client → Server | `{op:"unsubscribe-function", subId}` | `{id, type:"complete"}` |
+  | Server → Client | `{op:"function-result", subId, data}` | `{type:"next", id, op, doc}` (consumed; SDK orchestrates re-invoke) |
+  | Server → Client | `{op:"function-error", subId, code, message}` | `{type:"error", id, payload:{message}}` (logged) |
+
+- **HTTP envelope opt-in.** `await db.functions.x.y(args)` still posts
+  without `X-Excalibase-Envelope` and unwraps `{data}` for back-compat.
+  `.watch()` and its CDC-triggered re-invokes always send the envelope
+  header; the server must return `{result, reads}` in that case.
+
+### Internals
+
+- `FunctionsNamespace._invokeWithEnvelope(...)` is now the entry the
+  reactive orchestrator uses; `_postFunction` is the shared transport.
+- `ReactiveWebSocket` now takes an `invoke` callback instead of speaking
+  the function-subscription wire op directly. The `projectId` option is
+  no longer used by the WS layer — projects are encoded in the function
+  URL on the HTTP side.
+
+### Migration
+
+```diff
+ const db = createClient({
+   url: "http://localhost:10000",
+   projectId: "acme/prod",
+   publishableKey: "esk_pub_live_...",
+-  wsUrl: "ws://localhost:10000/api/v1/realtime",
++  wsUrl: "ws://localhost:10000/graphql",
+ });
+
+ const sub = db.functions.posts.list({}).watch();
+ sub.onUpdate((posts) => render(posts));
+```
+
 ## 0.7.0 — 2026-05-13
 
 ### BREAKING

@@ -1,21 +1,49 @@
 # Reactive queries — `db.functions.<m>.<n>().watch()` + typed `api` graph
 
-Phase 9b.C added a `.watch()` API to `db.functions`. Every call still returns
-a thenable for `await` (one-shot HTTP), and now also exposes `.watch()` to
-subscribe to push updates over a WebSocket.
+Every `db.functions.<module>.<name>(args)` call returns a thenable for `await`
+(one-shot HTTP) AND exposes `.watch()` to subscribe to reactive updates over
+WebSocket.
 
-Phase 7.1 added a parallel typed `api`/`internal` value graph emitted by
-codegen alongside `functions.types.ts`. Pass a ref like `api.users.list` to
-function runtime helpers (`ctx.runQuery`, `ctx.runMutation`) and TS infers
-both `args` and the return type from the ref.
+Codegen emits a parallel typed `api`/`internal` value graph alongside
+`functions.types.ts`. Pass a ref like `api.users.list` to function runtime
+helpers (`ctx.runQuery`, `ctx.runMutation`) and TS infers both `args` and the
+return type from the ref.
+
+## Architecture
+
+```
+QUERY / MUTATION / ACTION  ── SDK ──HTTP──> provisioning ──> functions runtime
+                                            returns { result, reads }
+
+REALTIME EVENTS            ── SDK ──WS────> graphql collection-CDC
+                                            graphql-transport-ws subprotocol
+
+.watch() orchestration lives entirely in the SDK:
+  1. SDK invokes the function via HTTP with `X-Excalibase-Envelope: v1`
+     and receives `{ result, reads }`. `reads` is the list of CDC source
+     keys (e.g. `"nosql_posts"`, `"public_users"`) the handler depended on.
+  2. SDK opens one WS per `db` client to graphql's `/graphql` endpoint,
+     sends `{type:"connection_init"}`, waits for `{type:"connection_ack"}`.
+  3. Per dependency in `reads`, SDK sends
+     `{id, type:"subscribe", source, collection}`.
+  4. On `{type:"next", id, op, doc}` matching a sub's table-sub id, SDK
+     re-invokes the same function over HTTP, hashes the result with
+     SHA-256, dedups, and fires `onUpdate(data)` only when the hash differs.
+  5. `close()` sends `{id, type:"complete"}` for each per-table sub.
+```
+
+graphql is a "dumb" CDC pipe — it just streams raw collection events. The SDK
+is responsible for translating those events into query-level updates. Because
+re-invocation goes back over HTTP, a query with high handler latency produces
+correspondingly delayed reactive updates.
 
 ## Two paths, same metadata
 
 | Path | Use case | Typed? |
 |------|----------|--------|
-| `db.functions.users.list(args)` | Client-side RPC over HTTP / WS | Yes (via `Functions` generic, Phase 2) |
-| `ctx.runQuery(api.users.list, args)` | Function-to-function calls server-side | Yes (via `FunctionRef<Args, Result>`, Phase 7.1) |
-| `ctx.runMutation(internal.admin.cleanup, args)` | Internal-only graph (never exposed to clients) | Yes (Phase 7.1) |
+| `db.functions.users.list(args)` | Client-side RPC over HTTP / WS | Yes (via `Functions` generic) |
+| `ctx.runQuery(api.users.list, args)` | Function-to-function calls server-side | Yes (via `FunctionRef<Args, Result>`) |
+| `ctx.runMutation(internal.admin.cleanup, args)` | Internal-only graph (never exposed to clients) | Yes |
 
 Codegen emits BOTH `functions.types.ts` (the type-only `Functions` interface)
 and `api.ts` (the runtime value graph) from the same metadata endpoint:
@@ -29,52 +57,6 @@ npx excalibase-codegen functions \
   --api-out src/api.ts        # optional; default: <dirname(--out)>/api.ts
 ```
 
-Generated `api.ts` shape:
-
-```ts
-import type { FunctionRef } from "@excalibase/sdk";
-
-export interface Users_List_Args { status: string; limit?: number }
-// ...
-
-export const api = {
-  users: {
-    list: { moduleName: "users", exportName: "list", kind: "query" }
-            as FunctionRef<Users_List_Args, unknown>,
-    create: { moduleName: "users", exportName: "create", kind: "mutation" }
-            as FunctionRef<Users_Create_Args, unknown>,
-  },
-} as const;
-
-export const internal = {
-  admin: {
-    cleanup: { moduleName: "admin", exportName: "cleanup", kind: "internalMutation" }
-              as FunctionRef<Admin_Cleanup_Args, unknown>,
-  },
-} as const;
-```
-
-Call sites:
-
-```ts
-// Server-side (inside a function body) — typed via FunctionRef.
-const posts = await ctx.runQuery(api.users.list, { status: "active" });
-await ctx.runMutation(internal.admin.cleanup, { olderThanDays: 30 });
-
-// Client-side — Phase 2 surface still works.
-const posts2 = await db.functions.users.list({ status: "active" });
-```
-
-`internal` separates exports tagged `internalQuery`/`internalMutation`/
-`internalAction` from public ones. The SDK does not (and cannot) prevent a
-caller from typing `internal.admin.cleanup` directly — the separation is a
-discoverability + intent signal. The function runtime still enforces that
-internal exports are not callable over the public HTTP surface.
-
-> **Return-type inference (Phase 7.2)** — `TResult` is currently `unknown`.
-> Once the bundler emits a return-shape JSON Schema alongside `argsJsonSchema`,
-> codegen will swap `unknown` for the inferred type.
-
 ## Quick start
 
 ```ts
@@ -84,13 +66,13 @@ const db = createClient({
   url: "http://localhost:10000",
   projectId: "acme/prod",
   publishableKey: "esk_pub_live_...",
-  // NEW (Phase 15c): points at graphql's `/api/v1/realtime` WebSocket.
-  // Multiplexed with collection-level CDC subscriptions over one socket.
+  // Points at graphql's /graphql endpoint (graphql-transport-ws
+  // subprotocol). Multiplexed across all watch subs on this client.
   // Required for `.watch()`. Omit it to disable reactive.
-  wsUrl: "ws://localhost:10000/api/v1/realtime",
+  wsUrl: "ws://localhost:10000/graphql",
 });
 
-// One-shot (unchanged from Phase 2)
+// One-shot HTTP
 const initial = await db.functions.posts.list({ status: "published" });
 
 // Reactive
@@ -99,8 +81,8 @@ const unsub = sub.onUpdate((posts) => render(posts));
 sub.onError((err) => console.error(err.code, err.message));
 
 // Tear down
-unsub();      // remove this listener
-sub.close();  // close the subscription server-side
+unsub();
+sub.close();
 ```
 
 ## API
@@ -109,93 +91,104 @@ sub.close();  // close the subscription server-side
 
 Returned from every `db.functions.<m>.<n>(args)` call.
 
-- `await query` — one-shot HTTP POST (Phase 2 behavior, unchanged).
+- `await query` — one-shot HTTP POST (no envelope header; back-compat `{data}` unwrap).
 - `query.watch()` — open a reactive subscription. Returns a `Subscription<T>`.
 
 ### `Subscription<T>`
 
 ```ts
 interface Subscription<T> {
-  onUpdate(handler: (data: T) => void): () => void; // returns unsubscribe
+  onUpdate(handler: (data: T) => void): () => void;
   onError(handler: (err: SubError) => void): () => void;
   close(): void;
 }
 
 interface SubError {
-  code: string;     // e.g. "permission_denied", "not_found", "validation"
+  code: string;     // "auth_timeout" | "invoke_error" | "subscribe_failed" | ...
   message: string;
 }
 ```
 
 ### `createClient({ wsUrl })`
 
-`wsUrl` is the WS endpoint of the graphql server's realtime handler — the
-same path that already powers collection-level CDC subscriptions. Function
-subscriptions multiplex on top of the same socket.
+`wsUrl` points at graphql's `/graphql` endpoint. The SDK opens the WS with the
+`graphql-transport-ws` subprotocol.
 
 ```
-ws(s)://<graphql-host>/api/v1/realtime
+ws(s)://<graphql-host>:<port>/graphql
 ```
 
-When `wsUrl` is omitted, calling `.watch()` throws a clear error. `await`
-calls still work without `wsUrl`.
+When `wsUrl` is omitted, calling `.watch()` throws a clear error. `await` calls
+still work without `wsUrl`.
 
 ## Wire protocol
 
-The SDK opens a plain WebSocket to graphql's `/api/v1/realtime` endpoint (no
-custom subprotocol). Authentication follows the GraphQL-WS convention used by
-the collection-subscription protocol that already lives on the same endpoint.
+The SDK speaks two protocols:
+
+### HTTP — function invoke (envelope on `.watch()`)
+
+```
+POST {url}/functions/v1/{projectId}/{module}.{export}
+Headers:
+  Authorization: Bearer <jwt>
+  X-Excalibase-Envelope: v1     # added only by .watch() / re-invokes
+  Content-Type: application/json
+Body: {"args": <args>}
+Response (envelope on):  {"result": <handler return>, "reads": ["nosql_posts", "public_users"]}
+Response (envelope off): {"data":   <handler return>}                 # back-compat
+```
+
+`await db.functions.x.y(args)` does NOT send the envelope header — it preserves
+the existing `{data}` unwrap. Reactive invocations always do.
+
+### WebSocket — collection-CDC
+
+After WS open:
+
+```json
+client → server: {"type":"connection_init"}
+server → client: {"type":"connection_ack"}
+client → server: {"id":"u1-t1","type":"subscribe","source":"nosql","collection":"posts"}
+server → client: {"type":"next","id":"u1-t1","op":"insert","doc":{...}}
+server → client: {"type":"next","id":"u1-t1","op":"update","doc":{...}}
+client → server: {"id":"u1-t1","type":"complete"}
+```
+
+`source` values: `"nosql"` (NoSQL collections), `"public"` / `"rest"` (SQL
+tables). Read keys (server-emitted in the envelope's `reads` array) are
+`<source>_<collection>`; keys without an `_` default to `source="public"`.
 
 ### Auth handshake
 
-1. Client opens the WebSocket.
-2. Client sends:
-   ```json
-   {"type":"connection_init","payload":{"Authorization":"Bearer <jwt>"}}
-   ```
-3. Server replies:
-   ```json
-   {"type":"connection_ack"}
-   ```
-4. Once the ack lands, the client may send `subscribe-function` frames.
-   If no ack arrives within 5 s (or the server closes mid-handshake) every
-   pending sub receives `SubError({code:"auth_timeout"})`.
-
-### Frames (post-ack)
-
-Frames are JSON.
-
-| Direction | Frame |
-|-----------|-------|
-| Client → Server | `{op:"subscribe-function",subId,projectId,ref:{moduleName,exportName},args}` |
-| Client → Server | `{op:"unsubscribe-function",subId}` |
-| Server → Client | `{op:"function-result",subId,data,pageStatus?}` |
-| Server → Client | `{op:"function-error",subId,code,message}` |
-
-The `pageStatus` field (`"SplitRecommended"` / `"SplitRequired"` / `null`) is
-passed through to the subscription handler as part of `data`. The SDK does
-not interpret it — surface it to your UI for pagination hints.
-
-Server-emitted `code` values from graphql 15a: `bad_request`, `unauthenticated`,
-`functions_disabled`, `invoke_failed_status_<N>`, `invoke_transport_error`.
+The JWT is captured per (re)connect via the SDK's `jwtProvider`. If no
+`connection_ack` arrives within 5 s, every pending sub receives
+`SubError({code:"auth_timeout"})`.
 
 ## Connection lifecycle
 
-- **One WS per client.** All `.watch()` subscriptions on a `db` instance
-  multiplex over a single socket. The socket opens lazily on the first
-  `.watch()` and stays alive until explicitly closed.
+- **One WS per client.** All `.watch()` subscriptions multiplex over a single
+  socket. The socket opens lazily on the first `.watch()` and stays alive
+  until explicitly closed.
 - **Reconnect.** On unexpected disconnect, the client reconnects with
   exponential backoff: `1s, 2s, 4s, 8s, 16s, 30s, 30s, …` (jittered ±20%).
-  On every (re)connect the SDK sends a fresh `connection_init` and waits
-  for `connection_ack` before replaying pending `subscribe-function` frames.
+  On every (re)connect the SDK sends a fresh `connection_init` and re-issues
+  every active table sub with fresh ids.
 - **JWT refresh.** The current session's access token is read on every
-  (re)connect attempt — so a refreshed JWT takes effect on next reconnect.
-- **Heartbeat.** Native WebSocket ping/pong frames. The graphql server uses
-  the built-in TCP-level ping/pong of the WebSocket protocol (browser and
-  `ws` library handle these transparently); the SDK does not implement an
-  application-level heartbeat.
+  (re)connect attempt.
+- **Heartbeat.** Native WebSocket ping/pong (browser / `ws` library handle
+  these transparently).
 - **Close.** Call `db.functions_closeReactive()` on app teardown to send
-  unsubscribes for every live sub and close the socket cleanly.
+  `complete` for every live table sub and close the socket cleanly.
+
+## Coalescing and dedup
+
+- **Coalesce.** Bursts of CDC events on the same user-level sub collapse
+  into at most one in-flight HTTP re-invoke per sub. While an invoke is
+  running, additional events set a `pendingRerun` flag; a single trailing
+  invoke runs once the current one completes.
+- **Hash dedup.** Re-invoke results are SHA-256-hashed (stable JSON);
+  `onUpdate` fires only when the hash differs from the last emitted value.
+  Identical successive results are dropped.
 
 ## Known behavior
 
@@ -204,15 +197,19 @@ Server-emitted `code` values from graphql 15a: `bad_request`, `unauthenticated`,
   `db.functions_closeReactive()`). To force a JWT swap immediately, close
   the reactive socket — the next `.watch()` opens a fresh one with the new
   token.
-- **Browser bundler tree-shaking.** The `ws` Node peer dep is gated behind a
-  late `require("ws")` so browser bundlers can drop it. In a browser, the
+- **Browser bundler tree-shaking.** The `ws` Node peer dep is gated behind
+  a late `require("ws")` so browser bundlers can drop it. In a browser, the
   SDK uses `globalThis.WebSocket`. In Node 22+ the built-in global is used;
   in Node 18–21 you need `ws` installed (declared as an optional peer dep).
+- **Reads shift.** `reads` from a re-invoke is currently treated as a no-op
+  if it differs from the initial list. Newly-introduced dependencies will
+  miss invalidations until they appear on the original read set or the
+  user resubscribes.
 
-## Framework integration (Phase 9b.E)
+## Framework integration
 
-React/Vue/Svelte hooks that wrap `.watch()` ship in a follow-up phase. The
-primitives in this phase are stable; you can already write a 6-line hook:
+React/Vue/Svelte hooks that wrap `.watch()` ship in a follow-up. The
+primitives are stable; you can already write a 6-line hook:
 
 ```ts
 import { useEffect, useState } from "react";
