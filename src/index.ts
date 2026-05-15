@@ -1,11 +1,8 @@
 export { createClient, DbClient } from "./client";
 export { FunctionsNamespace } from "./functions/namespace";
-export type { LazyQuery, Subscription as FunctionsSubscription } from "./functions/namespace";
 export { FunctionsError } from "./functions/error";
 export type { ValidationIssue } from "./functions/error";
 export type { FunctionRef, DefaultFunctions, FunctionKind } from "./functions/types";
-export { ReactiveWebSocket } from "./functions/reactive_ws";
-export type { SubError } from "./functions/reactive_ws";
 export type { DatabaseShape, AnyDatabase, RowOf } from "./client";
 export { AuthClient } from "./auth";
 export { GraphqlNamespace } from "./graphql-ns";

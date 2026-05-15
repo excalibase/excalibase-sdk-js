@@ -2,6 +2,42 @@
 
 All notable changes to `@excalibase/sdk`.
 
+## 0.9.0
+
+### BREAKING
+
+- **Removed `.watch()` reactive subscriptions.** Every
+  `db.functions.<module>.<name>(args)` call now returns a plain `Promise`
+  instead of a `LazyQuery`. The `.watch()` method, the multiplexed
+  WebSocket, the read-key envelope, and the SDK-side dependency tracker
+  all go away.
+- `createClient` no longer accepts `wsUrl`. The field is removed from
+  `CreateClientOptions`; passing it is a type error.
+- `DbClient.functions_closeReactive()` is gone. Apps that previously
+  called it on teardown can remove the call.
+
+### Removed
+
+- `src/functions/reactive_ws.ts` (whole module — `ReactiveWebSocket`,
+  `SubError`, the graphql-transport-ws subprotocol implementation).
+- Public type exports: `LazyQuery`, `FunctionsSubscription`,
+  `ReactiveWebSocket`, `SubError`.
+- `docs/reactive-queries.md`.
+- `test/functions-watch.test.ts`.
+
+### Migration
+
+```ts
+// Before:
+const sub = db.functions.posts.list({}).watch();
+sub.onUpdate((rows) => render(rows));
+
+// After: re-fetch when you know the data changed. The graphql
+// subscription endpoint (`db.graphql.subscribe(...)`) and the REST CDC
+// WebSocket (`/api/v1/realtime`) are the supported reactive substrates;
+// re-invoke the function inside the subscription's onUpdate.
+```
+
 ## 0.8.0 — 2026-05-15
 
 ### BREAKING

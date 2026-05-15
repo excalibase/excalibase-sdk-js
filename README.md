@@ -136,30 +136,6 @@ const keys = await db.auth.listApiKeys();
 await db.auth.revokeApiKey(created.id);
 ```
 
-## Reactive queries (`.watch()`)
-
-`db.functions.<module>.<name>(args)` returns a thenable that's both awaitable
-(one-shot HTTP) and `.watch()`-able (push updates over a WebSocket):
-
-```ts
-const db = createClient({
-  url: "http://localhost:10000",
-  projectId: "acme/prod",
-  publishableKey: "esk_pub_live_...",
-  wsUrl: "ws://localhost:10001/functions/v1/acme/prod/_watch",
-});
-
-const sub = db.functions.posts.list({}).watch();
-const unsub = sub.onUpdate((posts) => render(posts));
-sub.onError((err) => console.error(err.code, err.message));
-// later: unsub(); or sub.close();
-```
-
-One WebSocket per client (multiplexed); reconnects on disconnect with
-exponential backoff (1s → 30s cap) and replays pending subscriptions. See
-[docs/reactive-queries.md](./docs/reactive-queries.md) for the wire protocol,
-auth-switch caveats, and framework integration sketch.
-
 ## Session persistence
 
 By default the SDK stores the session in `localStorage` when a browser is
