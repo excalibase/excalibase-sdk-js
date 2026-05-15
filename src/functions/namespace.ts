@@ -37,6 +37,13 @@ export interface FunctionsNamespaceOptions {
   wsUrl?: string;
   /** Returns the current JWT bearer token for the WS connection_init. */
   jwtProvider?: () => Promise<string> | string;
+  /**
+   * Optional WebSocket constructor. Lets callers pass an explicit
+   * implementation (e.g. the `ws` package on Node) when the SDK's
+   * auto-resolution can't find one. Browsers and Node 22+ pick up
+   * `globalThis.WebSocket` automatically; older Node typically needs this.
+   */
+  websocketImpl?: new (url: string, protocols?: string | string[]) => unknown;
 }
 
 export interface Subscription<T = unknown> {
@@ -123,6 +130,7 @@ export class FunctionsNamespace<F = unknown> {
   readonly fetchImpl: typeof fetch;
   readonly wsUrl: string | undefined;
   readonly jwtProvider: (() => Promise<string> | string) | undefined;
+  readonly websocketImpl: (new (url: string, protocols?: string | string[]) => unknown) | undefined;
   private _reactive: ReactiveWebSocket | null = null;
   private _subIdCounter = 0;
 
@@ -133,6 +141,7 @@ export class FunctionsNamespace<F = unknown> {
     this.fetchImpl = opts.fetchImpl;
     this.wsUrl = opts.wsUrl;
     this.jwtProvider = opts.jwtProvider;
+    this.websocketImpl = opts.websocketImpl;
     return new Proxy(this, {
       get(target, prop, receiver): unknown {
         if (RESERVED_TOP_KEYS.has(prop)) return Reflect.get(target, prop, receiver);
@@ -283,6 +292,7 @@ export class FunctionsNamespace<F = unknown> {
       jwtProvider: this.jwtProvider ?? (() => ""),
       invoke: (ref: FunctionRefMsg, args: unknown) =>
         this._invokeWithEnvelope(ref.moduleName, ref.exportName, args),
+      websocketImpl: this.websocketImpl as never,
     });
     this._reactive = ws;
     return ws;

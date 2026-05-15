@@ -36,7 +36,8 @@
  * per-table subscribe frames (new table-sub ids on a new connection).
  */
 
-import { createHash } from "crypto";
+// sha256 uses Web Crypto (globalThis.crypto.subtle) so the SDK stays platform-
+// neutral across Node 19+, browsers, and Deno without pulling Node-only deps.
 
 export interface FunctionRefMsg {
   moduleName: string;
@@ -208,12 +209,19 @@ function stableStringify(value: unknown): string {
   return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",") + "}";
 }
 
-function sha256(input: string): string {
-  return createHash("sha256").update(input).digest("hex");
+async function sha256(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  const view = new Uint8Array(digest);
+  let hex = "";
+  for (let i = 0; i < view.length; i += 1) {
+    hex += view[i].toString(16).padStart(2, "0");
+  }
+  return hex;
 }
 
 /** Exposed for unit-level coverage of hash dedup. */
-export function __hashResultForTest(value: unknown): string {
+export async function __hashResultForTest(value: unknown): Promise<string> {
   return sha256(stableStringify(value));
 }
 
@@ -342,7 +350,7 @@ export class ReactiveWebSocket {
     }
     if (sub.closed) return;
     sub.reads = [...envelope.reads];
-    sub.lastResultHash = sha256(stableStringify(envelope.result));
+    sub.lastResultHash = await sha256(stableStringify(envelope.result));
     this.safeFire(() => sub.onUpdate(envelope.result), sub);
     // Now ensure socket + send table subs.
     try {
@@ -625,7 +633,7 @@ export class ReactiveWebSocket {
           break;
         }
         if (sub.closed) return;
-        const newHash = sha256(stableStringify(envelope.result));
+        const newHash = await sha256(stableStringify(envelope.result));
         if (newHash !== sub.lastResultHash) {
           sub.lastResultHash = newHash;
           this.safeFire(() => sub.onUpdate(envelope.result), sub);
