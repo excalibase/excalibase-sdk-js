@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1
+
+### Patch Changes
+
+- 14b167d: Correct package keywords to reflect the full SDK surface — REST, storage, auth, and MySQL — not just GraphQL/Postgres.
+
 All notable changes to `@excalibase/sdk`.
 
 ## 0.9.0
@@ -48,7 +54,6 @@ sub.onUpdate((rows) => render(rows));
   `{op:"function-result"}`) is gone — it never existed on the graphql side
   in the new architecture, so any client that spoke it was broken in
   practice. The orchestrator now lives in the SDK:
-
   1. HTTP-invoke the function with `X-Excalibase-Envelope: v1` to receive
      `{result, reads}`.
   2. Open one WS per `db` client to `ws(s)://<graphql-host>/graphql` with
@@ -85,12 +90,12 @@ sub.onUpdate((rows) => render(rows));
 
 - **Wire protocol change (post-handshake).**
 
-  | Direction | Old frame | New frame |
-  |-----------|-----------|-----------|
-  | Client → Server | `{op:"subscribe-function", ...}` | `{id, type:"subscribe", source, collection}` |
-  | Client → Server | `{op:"unsubscribe-function", subId}` | `{id, type:"complete"}` |
-  | Server → Client | `{op:"function-result", subId, data}` | `{type:"next", id, op, doc}` (consumed; SDK orchestrates re-invoke) |
-  | Server → Client | `{op:"function-error", subId, code, message}` | `{type:"error", id, payload:{message}}` (logged) |
+  | Direction       | Old frame                                     | New frame                                                           |
+  | --------------- | --------------------------------------------- | ------------------------------------------------------------------- |
+  | Client → Server | `{op:"subscribe-function", ...}`              | `{id, type:"subscribe", source, collection}`                        |
+  | Client → Server | `{op:"unsubscribe-function", subId}`          | `{id, type:"complete"}`                                             |
+  | Server → Client | `{op:"function-result", subId, data}`         | `{type:"next", id, op, doc}` (consumed; SDK orchestrates re-invoke) |
+  | Server → Client | `{op:"function-error", subId, code, message}` | `{type:"error", id, payload:{message}}` (logged)                    |
 
 - **HTTP envelope opt-in.** `await db.functions.x.y(args)` still posts
   without `X-Excalibase-Envelope` and unwraps `{data}` for back-compat.
@@ -142,7 +147,7 @@ sub.onUpdate((rows) => render(rows));
 
   This is marked BREAKING because callers that previously passed an
   invalid id (e.g. `bad@id`) and relied on the ConfigError to fire will
-  still throw — but the *message* changed to mention the new regex.
+  still throw — but the _message_ changed to mention the new regex.
 
 ### Added
 
@@ -199,8 +204,8 @@ sub.onUpdate((rows) => render(rows));
   performs a GraphQL-WS-style auth handshake:
   - Client → Server: `{"type":"connection_init","payload":{"Authorization":"Bearer <jwt>"}}`
   - Server → Client: `{"type":"connection_ack"}`
-  If no ack arrives within 5 s (or the server closes before ack), every
-  pending subscription receives `SubError({code:"auth_timeout"})`.
+    If no ack arrives within 5 s (or the server closes before ack), every
+    pending subscription receives `SubError({code:"auth_timeout"})`.
 - **Frame op-names renamed:**
   - `{op:"subscribe", ...}` → `{op:"subscribe-function", subId, projectId, ref, args}`
   - `{op:"unsubscribe", ...}` → `{op:"unsubscribe-function", subId}`
