@@ -1,6 +1,6 @@
 {
   "name": "@excalibase/sdk",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Official TypeScript client for Excalibase GraphQL and REST APIs",
   "keywords": [
     "excalibase",
