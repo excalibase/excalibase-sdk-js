@@ -5,9 +5,14 @@
   "keywords": [
     "excalibase",
     "graphql",
+    "rest",
     "postgres",
+    "mysql",
     "sdk",
-    "client"
+    "client",
+    "typescript",
+    "storage",
+    "auth"
   ],
   "license": "Apache-2.0",
   "repository": {
