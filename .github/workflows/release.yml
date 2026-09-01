@@ -9,7 +9,6 @@ concurrency: ${{ github.workflow }}-${{ github.ref }}
 permissions:
   contents: write # changesets: push the version bump + tags
   pull-requests: write # changesets: open the "Version Packages" PR
-  id-token: write # provenance
 
 jobs:
   release:
@@ -27,10 +26,12 @@ jobs:
       - run: npm run test:coverage
       - run: npm run build
 
-      # No pending changesets -> publishes any package whose version isn't on npm
-      # yet (so 0.9.0 ships first). Pending changesets -> opens/updates the
-      # "Version Packages" PR that bumps + writes CHANGELOG instead.
-      # TODO: switch to OIDC Trusted Publishing (drop NPM_TOKEN) once the package exists.
+      # changesets/action reads the env var literally named NPM_TOKEN to decide
+      # token auth vs OIDC. It MUST be NPM_TOKEN (not NODE_AUTH_TOKEN) or the
+      # action falls back to trusted publishing, which isn't configured.
+      # No pending changesets -> publishes versions not yet on npm (0.9.0 first).
+      # Pending changesets -> opens/updates the "Version Packages" PR instead.
+      # TODO: switch to OIDC Trusted Publishing (drop NPM_TOKEN) later.
       - name: Create Version PR or publish to npm
         uses: changesets/action@v1
         with:
@@ -38,5 +39,4 @@ jobs:
           publish: npm run release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_PROVENANCE: "true"
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
