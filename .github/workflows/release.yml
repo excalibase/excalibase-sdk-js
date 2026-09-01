@@ -7,9 +7,9 @@ on:
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 permissions:
-  contents: write # push the version bump + tags
-  pull-requests: write # open the "Version Packages" PR
-  id-token: write # npm provenance
+  contents: write # changesets: push the version bump + tags
+  pull-requests: write # changesets: open the "Version Packages" PR
+  id-token: write # OIDC — Trusted Publishing + automatic provenance
 
 jobs:
   release:
@@ -18,18 +18,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24 # Trusted Publishing needs Node >= 22.14
           registry-url: https://registry.npmjs.org
           cache: npm
+
+      # Trusted Publishing requires npm >= 11.5.1 (newer than what Node bundles).
+      - run: npm install -g npm@latest
 
       - run: npm ci
       - run: npm run typecheck
       - run: npm run test:coverage
       - run: npm run build
 
-      # No pending changesets -> publishes any package whose version isn't on
-      # npm yet (so 0.9.0 ships on the first run). Pending changesets -> opens or
-      # updates the "Version Packages" PR that bumps + writes CHANGELOG instead.
+      # No NPM_TOKEN — `npm publish` (via `changeset publish`) authenticates over
+      # OIDC because id-token:write is set and this repo is a configured trusted
+      # publisher on npm. Provenance is generated automatically.
       - name: Create Version PR or publish to npm
         uses: changesets/action@v1
         with:
@@ -37,5 +40,3 @@ jobs:
           publish: npm run release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_PROVENANCE: "true"
