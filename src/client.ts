@@ -61,9 +61,9 @@ export class DbClient<
    */
   readonly functions: Functions;
   /**
-   * Phase 10 — Convex-shape file-storage client. Wraps the direct-upload
-   * pattern: call a developer-authored mutation to mint a signed PUT URL,
-   * PUT the blob bytes to that URL, return the minted storageId.
+   * File-storage client. `uploadFile` mints a signed URL for the blob's
+   * declared size and type, PUTs the bytes, completes the upload, and
+   * returns the storageId.
    *
    *   const { storageId } = await db.storage.uploadFile(blob);
    *

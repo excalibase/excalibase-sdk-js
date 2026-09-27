@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.0
+
+### Minor Changes
+
+- BREAKING: `db.storage.uploadFile` speaks the staged upload protocol. The mint mutation now receives `{ contentType, size }` and must return `{ url, storageId, uploadId }`; the blob is PUT with both `Content-Type` and `Content-Length`; a completion mutation (default `system.completeUpload`, override with `opts.completeRef`) is called with `{ storageId, uploadId }` before the `storageId` is returned. The fallback that read a `storageId` from the PUT response is removed. A PUT refused with HTTP 403 means the bytes did not match the declared size or type.
+
 ## 0.9.1
 
 ### Patch Changes

@@ -1,22 +1,11 @@
 /**
- * Phase 10 — `db.storage.uploadFile(blob)` Convex-shape client flow.
- *
- * Convex pattern (mirrored here):
- *   1. Client invokes a developer-authored mutation that returns the
- *      signed PUT URL minted by `ctx.storage.generateUploadUrl()`.
- *   2. Client PUTs the blob bytes directly to that signed URL (no
- *      function-runtime bandwidth consumed).
- *   3. The signed-URL endpoint responds with the storageId.
- *
- * The SDK helper wraps steps 1 + 2 + 3:
- *
- *   const { storageId } = await db.storage.uploadFile(blob);
- *
- * It calls a conventionally-named mutation (`api.system.generateUploadUrl`
- * by default; overridable via opts.ref) to mint the URL, PUTs the blob,
- * and returns the parsed response.
- *
- * These tests assert the full pipeline against captured fetch mocks.
+ * `db.storage.uploadFile(blob)` speaks the staged upload protocol:
+ *   1. a mutation mints the URL for a declared `{ contentType, size }` and
+ *      returns `{ url, storageId, uploadId }`;
+ *   2. the blob is PUT with exactly that Content-Type and Content-Length
+ *      (both are covered by the signature);
+ *   3. a second mutation completes the upload by `{ storageId, uploadId }`.
+ * Only a completed upload becomes an object, so the id is returned after step 3.
  */
 
 import { describe, test, expect } from "@jest/globals";
@@ -94,90 +83,139 @@ function makeClient(fetchImpl: typeof fetch) {
   });
 }
 
-describe("db.storage.uploadFile (Phase 10)", () => {
-  test("posts to the generateUploadUrl mutation, then PUTs the blob, returns storageId", async () => {
-    const { fetchImpl, calls } = captureRoutes({
-      // Mutation that mints the upload URL.
-      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
-        body: { data: { url: "https://r2.test/upload?sig=ABC", storageId: "kg2_minted" } },
-      },
-      // R2 PUT — returns 200 with no body.
-      "PUT https://r2.test/upload?sig=ABC": {
-        body: "",
-        bodyType: "raw",
-      },
-    });
+const MINT = "http://localhost:10000/functions/v1/default/p/system.generateUploadUrl";
+const COMPLETE = "http://localhost:10000/functions/v1/default/p/system.completeUpload";
+const MINTED = { url: "https://r2.test/upload?sig=ABC", storageId: "kg2_minted", uploadId: "upl_1" };
+
+function header(req: CapturedRequest, name: string): string | undefined {
+  return req.headers[name] ?? req.headers[name.toLowerCase()];
+}
+
+function happyRoutes(overrides: Record<string, { status?: number; body: unknown; bodyType?: string }> = {}) {
+  return captureRoutes({
+    [`POST ${MINT}`]: { body: { data: MINTED } },
+    [`PUT ${MINTED.url}`]: { body: "", bodyType: "raw" },
+    [`POST ${COMPLETE}`]: { body: { data: MINTED.storageId } },
+    ...overrides,
+  });
+}
+
+describe("db.storage.uploadFile", () => {
+  test("declares the type and size, PUTs with both headers, completes, returns storageId", async () => {
+    const { fetchImpl, calls } = happyRoutes();
     const db = makeClient(fetchImpl);
     const blob = new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" });
+
     const result = await db.storage.uploadFile(blob);
+
     expect(result).toEqual({ storageId: "kg2_minted" });
-
-    const recorded = calls();
-    expect(recorded.length).toBe(2);
-    expect(recorded[0].method).toBe("POST");
-    expect(recorded[0].url).toBe("http://localhost:10000/functions/v1/default/p/system.generateUploadUrl");
-    expect(recorded[1].method).toBe("PUT");
-    expect(recorded[1].url).toBe("https://r2.test/upload?sig=ABC");
-    expect(recorded[1].headers["Content-Type"] || recorded[1].headers["content-type"]).toBe("image/png");
-    // The blob bytes were sent (3 bytes).
-    expect(recorded[1].body).toEqual({ __bytes: 3 });
+    const [mint, put, complete] = calls();
+    expect(calls().length).toBe(3);
+    expect(mint.url).toBe(MINT);
+    expect(mint.body).toEqual({ args: { contentType: "image/png", size: 3 } });
+    expect(put.method).toBe("PUT");
+    expect(put.url).toBe(MINTED.url);
+    expect(header(put, "Content-Type")).toBe("image/png");
+    expect(header(put, "Content-Length")).toBe("3");
+    expect(put.body).toEqual({ __bytes: 3 });
+    expect(complete.method).toBe("POST");
+    expect(complete.url).toBe(COMPLETE);
+    expect(complete.body).toEqual({ args: { storageId: "kg2_minted", uploadId: "upl_1" } });
   });
 
-  test("supports overriding the mutation ref via opts.ref", async () => {
+  test("declares application/octet-stream for an untyped blob and PUTs with the same type", async () => {
+    const { fetchImpl, calls } = happyRoutes();
+    const db = makeClient(fetchImpl);
+    await db.storage.uploadFile(new Blob([new Uint8Array(8)]));
+    const [mint, put] = calls();
+    expect(mint.body).toEqual({ args: { contentType: "application/octet-stream", size: 8 } });
+    expect(header(put, "Content-Type")).toBe("application/octet-stream");
+    expect(header(put, "Content-Length")).toBe("8");
+  });
+
+  test("uses opts.ref and opts.completeRef for the two mutations", async () => {
     const { fetchImpl, calls } = captureRoutes({
-      "POST http://localhost:10000/functions/v1/default/p/photos.signUpload": {
-        body: { data: { url: "https://r2.test/upload?sig=XYZ", storageId: "kg2_x" } },
-      },
-      "PUT https://r2.test/upload?sig=XYZ": {
-        body: "",
-        bodyType: "raw",
-      },
+      "POST http://localhost:10000/functions/v1/default/p/photos.signUpload": { body: { data: MINTED } },
+      [`PUT ${MINTED.url}`]: { body: "", bodyType: "raw" },
+      "POST http://localhost:10000/functions/v1/default/p/photos.attachUpload": { body: { data: null } },
     });
     const db = makeClient(fetchImpl);
-    const blob = new Blob(["hello"], { type: "text/plain" });
-    const result = await db.storage.uploadFile(blob, { ref: { moduleName: "photos", exportName: "signUpload" } });
-    expect(result).toEqual({ storageId: "kg2_x" });
-    const recorded = calls();
-    expect(recorded[0].url).toBe("http://localhost:10000/functions/v1/default/p/photos.signUpload");
+    const result = await db.storage.uploadFile(new Blob(["hello"], { type: "text/plain" }), {
+      ref: { moduleName: "photos", exportName: "signUpload" },
+      completeRef: { moduleName: "photos", exportName: "attachUpload" },
+    });
+    expect(result).toEqual({ storageId: "kg2_minted" });
+    expect(calls()[0].url).toBe("http://localhost:10000/functions/v1/default/p/photos.signUpload");
+    expect(calls()[2].url).toBe("http://localhost:10000/functions/v1/default/p/photos.attachUpload");
   });
 
-  test("throws when the mutation does not exist (404 from functions endpoint)", async () => {
+  test("throws when the mint mutation does not exist (404 from functions endpoint)", async () => {
     const { fetchImpl } = captureRoutes({
-      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
-        status: 404,
-        body: { error: "function not found" },
-      },
+      [`POST ${MINT}`]: { status: 404, body: { error: "function not found" } },
     });
     const db = makeClient(fetchImpl);
-    const blob = new Blob(["x"], { type: "text/plain" });
-    await expect(db.storage.uploadFile(blob)).rejects.toThrow();
+    await expect(db.storage.uploadFile(new Blob(["x"], { type: "text/plain" }))).rejects.toThrow(/HTTP 404/);
   });
 
-  test("throws when the PUT to the signed URL fails", async () => {
-    const { fetchImpl } = captureRoutes({
-      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
-        body: { data: { url: "https://r2.test/upload?sig=BAD", storageId: "kg2_x" } },
-      },
-      "PUT https://r2.test/upload?sig=BAD": {
-        status: 500,
-        body: "internal error",
-        bodyType: "raw",
-      },
-    });
+  test("throws FunctionsError when the mint mutation returns an error envelope", async () => {
+    const { fetchImpl } = captureRoutes({ [`POST ${MINT}`]: { body: { error: "quota exceeded" } } });
     const db = makeClient(fetchImpl);
-    const blob = new Blob(["x"], { type: "text/plain" });
-    await expect(db.storage.uploadFile(blob)).rejects.toThrow(/upload failed/i);
+    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(/quota exceeded/);
   });
 
-  test("throws when the mutation response is missing the url field", async () => {
-    const { fetchImpl } = captureRoutes({
-      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
-        body: { data: { storageId: "kg2_x" } }, // no url
-      },
+  test.each([
+    ["url", { storageId: "kg2_x", uploadId: "upl_1" }],
+    ["storageId", { url: "https://r2.test/u", uploadId: "upl_1" }],
+    ["uploadId", { url: "https://r2.test/u", storageId: "kg2_x" }],
+  ])("throws before uploading when the mint result has no %s", async (missing, data) => {
+    const { fetchImpl, calls } = captureRoutes({ [`POST ${MINT}`]: { body: { data } } });
+    const db = makeClient(fetchImpl);
+    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(new RegExp(missing));
+    expect(calls().length).toBe(1);
+  });
+
+  test("a PUT the object store refuses (declared size or type differs) fails clearly and is not completed", async () => {
+    const { fetchImpl, calls } = happyRoutes({
+      [`PUT ${MINTED.url}`]: { status: 403, body: "SignatureDoesNotMatch", bodyType: "raw" },
     });
     const db = makeClient(fetchImpl);
-    const blob = new Blob(["x"], { type: "text/plain" });
-    await expect(db.storage.uploadFile(blob)).rejects.toThrow(/url/i);
+    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(
+      /upload refused \(HTTP 403\).*size and type/,
+    );
+    expect(calls().length).toBe(2);
+  });
+
+  test("throws when the PUT fails for another reason", async () => {
+    const { fetchImpl } = happyRoutes({
+      [`PUT ${MINTED.url}`]: { status: 500, body: "internal error", bodyType: "raw" },
+    });
+    const db = makeClient(fetchImpl);
+    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(/upload failed \(HTTP 500\)/);
+  });
+
+  test("does not return a storageId when completing the upload is refused", async () => {
+    const { fetchImpl } = happyRoutes({
+      [`POST ${COMPLETE}`]: { status: 413, body: { error: "project storage quota exceeded" } },
+    });
+    const db = makeClient(fetchImpl);
+    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(/system\.completeUpload returned HTTP 413/);
+  });
+
+  test("does not return a storageId when the completion mutation returns an error envelope", async () => {
+    const { fetchImpl } = happyRoutes({
+      [`POST ${COMPLETE}`]: { body: { error: "content type not allowed" } },
+    });
+    const db = makeClient(fetchImpl);
+    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(/content type not allowed/);
+  });
+
+  test("ignores a storageId in the PUT response: only the minted one is used", async () => {
+    const { fetchImpl } = happyRoutes({
+      [`PUT ${MINTED.url}`]: { body: { storageId: "kg2_fromPut" } },
+    });
+    const db = makeClient(fetchImpl);
+    const { storageId } = await db.storage.uploadFile(new Blob(["x"]));
+    expect(storageId).toBe("kg2_minted");
   });
 
   test("rejects on missing blob argument", async () => {
@@ -187,65 +225,5 @@ describe("db.storage.uploadFile (Phase 10)", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (db.storage as any).uploadFile(undefined),
     ).rejects.toThrow(/blob/i);
-  });
-
-  test("throws FunctionsError when the mutation returns an error envelope", async () => {
-    const { fetchImpl } = captureRoutes({
-      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
-        body: { error: "quota exceeded" },
-      },
-    });
-    const db = makeClient(fetchImpl);
-    const blob = new Blob(["x"], { type: "text/plain" });
-    await expect(db.storage.uploadFile(blob)).rejects.toThrow(/quota exceeded/);
-  });
-
-  test("falls back to storageId from the PUT response when the mutation didn't carry one", async () => {
-    // Mutation returns only the url; the PUT response body carries the id.
-    const { fetchImpl } = captureRoutes({
-      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
-        body: { data: { url: "https://r2.test/u?s=fb" } },
-      },
-      "PUT https://r2.test/u?s=fb": {
-        body: { storageId: "kg2_fromPut" },
-      },
-    });
-    const db = makeClient(fetchImpl);
-    const blob = new Blob(["x"], { type: "text/plain" });
-    const { storageId } = await db.storage.uploadFile(blob);
-    expect(storageId).toBe("kg2_fromPut");
-  });
-
-  test("throws when neither the mutation nor the PUT response carry a storageId", async () => {
-    const { fetchImpl } = captureRoutes({
-      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
-        body: { data: { url: "https://r2.test/u?s=no" } },
-      },
-      "PUT https://r2.test/u?s=no": {
-        body: "",
-        bodyType: "raw",
-      },
-    });
-    const db = makeClient(fetchImpl);
-    const blob = new Blob(["x"], { type: "text/plain" });
-    await expect(db.storage.uploadFile(blob)).rejects.toThrow(/storageId/);
-  });
-
-  test("falls back to storageId from the response body when the PUT response doesn't carry one", async () => {
-    // R2 PUTs typically don't echo storageId in the response; the SDK
-    // must source it from the original mutation response (Convex parity).
-    const { fetchImpl } = captureRoutes({
-      "POST http://localhost:10000/functions/v1/default/p/system.generateUploadUrl": {
-        body: { data: { url: "https://r2.test/u?s=1", storageId: "kg2_fromMutation" } },
-      },
-      "PUT https://r2.test/u?s=1": {
-        body: "",
-        bodyType: "raw",
-      },
-    });
-    const db = makeClient(fetchImpl);
-    const blob = new Blob([new Uint8Array(8)], { type: "application/octet-stream" });
-    const { storageId } = await db.storage.uploadFile(blob);
-    expect(storageId).toBe("kg2_fromMutation");
   });
 });
