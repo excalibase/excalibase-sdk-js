@@ -32,6 +32,7 @@ export {
 export { FileStorageClient } from "./storage/client";
 export type {
   FileStorageClientOptions,
+  UploadMutationRef,
   UploadFileOptions,
   UploadFileResult,
 } from "./storage/client";
