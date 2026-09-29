@@ -60,7 +60,7 @@ await db.auth.signInWithPassword({
   password: "s3cret",
 });
 
-// 2. Anonymous API-key login (no user, scope="public")
+// 2. Anonymous API-key login (no user, role "anon")
 await db.auth.signInWithApiKey();
 
 // 3. Run a GraphQL query with the current session
@@ -82,6 +82,25 @@ a browser context. Secret keys must only be used server-side.
 ```ts
 // This throws ConfigError in a browser:
 createClient({ ..., publishableKey: "esk_sec_live_..." });
+```
+
+## Roles
+
+Every request runs as one role, and the project's permissions for that role
+decide which tables, columns, rows and functions exist for it:
+
+- no session, or a publishable-key session (`signInWithApiKey()`): `anon`
+- a signed-in account: its role (`user` unless the project gave the account
+  another one)
+- a secret-key session (server-side only): `service`, which bypasses
+  permissions
+
+A token that allows more than one role can pick one per client with the
+`X-Excalibase-Role` header; a role the token does not allow is refused with
+403 `role_not_allowed`.
+
+```ts
+const editor = createClient({ ..., headers: { "X-Excalibase-Role": "editor" } });
 ```
 
 ## Full-text and vector search
