@@ -44,9 +44,14 @@ What it uses:
    network. Or through the API:
    `POST /api/projects/{projectId}/app-templates/storefront-demo/deploy` with
    `{"confirmPrivateNetwork": true}`.
-2. Run the setup script against the project. It needs a personal access token
-   (`excb_…`) of a Developer on the project, made with `POST /api/auth/tokens`
-   `{"name": "storefront setup"}` while signed in to the control plane:
+2. Make a personal access token for the setup script. In Studio, open
+   **Access tokens** (in the sidebar, or click your name), name it
+   `storefront setup`, choose **Read and write**, pick this project and a short
+   expiry such as 7 days, then **Create token** and copy it: it is shown once.
+   You must be an Admin or Owner of the project's organization, because the
+   script sets the demo accounts' roles. Revoke the token in the same place when
+   the store is set up.
+3. Run the setup script against the project with that token:
 
    ```bash
    cd examples/storefront && npm ci
@@ -67,7 +72,7 @@ What it uses:
    the store is redeployed. Running it again is safe: what exists is kept.
    The script also ships in the store's image, so no checkout is needed:
    `docker run --rm -e EXCALIBASE_API=… -e EXCALIBASE_TOKEN=… -e EXCALIBASE_DATA_URL=… -e PROJECT_ID=… <the template's image> node setup/setup.mjs`.
-3. Open the store's URL (printed at the end, and shown on the app in Studio).
+4. Open the store's URL (printed at the end, and shown on the app in Studio).
 
 The permissions are in [`setup/permissions.mjs`](setup/permissions.mjs) and the
 schema in [`setup/schema.sql`](setup/schema.sql).
