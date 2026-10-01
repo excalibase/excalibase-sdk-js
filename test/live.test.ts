@@ -6,6 +6,10 @@
  * `user` role reads and inserts, realtime on it, the `uploads.mint` and
  * `uploads.complete` functions, an end user); test/live/k3d-platform.sh brings
  * up platform-aio on k3d behind the HAProxy edge and runs both.
+ *
+ * The upload case runs only with SDK_LIVE_STORAGE=1: it needs the platform's
+ * function runtime to run query/mutation exports and reach storage
+ * (EXCALIBASE_FUNCTIONS_V2 and EXCALIBASE_PROVISIONING_URL, EXC-518).
  */
 import WebSocket from "ws";
 import { createClient, memoryStorageAdapter } from "../src";
@@ -13,6 +17,7 @@ import { createClient, memoryStorageAdapter } from "../src";
 const env = (name: string): string => process.env[name] ?? "";
 const LIVE = env("SDK_LIVE_URL").length > 0;
 const describeLive = LIVE ? describe : describe.skip;
+const itStorage = env("SDK_LIVE_STORAGE") === "1" ? it : it.skip;
 
 interface Note {
   id: number;
@@ -101,7 +106,7 @@ describeLive("live: createClient({ url, projectId, key }) on the platform edge",
     expect(change.operation).toBe("INSERT");
   }, 90_000);
 
-  it("uploads a file through /functions/v1/{projectId}", async () => {
+  itStorage("uploads a file through /functions/v1/{projectId}", async () => {
     const blob = new Blob([`hello from ${marker}`], { type: "text/plain" });
     const { storageId } = await db.storage.uploadFile(blob, {
       ref: { moduleName: "uploads", exportName: "mint" },
