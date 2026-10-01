@@ -88,10 +88,9 @@ VITE_EXCALIBASE_ORG_SLUG=<org slug> VITE_EXCALIBASE_PUBLISHABLE_KEY=<publishable
 
 | Path | What |
 |---|---|
-| `src/lib/client.ts` | the one `@excalibase/sdk` client |
-| `src/lib/platform-fetch.ts` | the SDK takes one base URL; this moves GraphQL, REST and functions calls to the project's paths on the data plane (`/{projectId}/graphql`), while auth stays at `/auth/{org}/{project}` |
+| `src/lib/client.ts` | the one `@excalibase/sdk` client: `createClient({ url, projectId, orgSlug, key })`, which builds the project's paths itself |
 | `src/lib/store.ts` | every query and mutation the store makes |
-| `src/lib/realtime.ts` | the order subscription (`graphql-ws`; the token goes in `connection_init`) |
+| `src/lib/realtime.ts` | the order subscription (`db.graphql.subscribe`; the SDK sends the token in `connection_init`) |
 | `server/` | the container's server: the SPA, `/config.js` (the project, from the app's variables), `/api/views` and `/api/trending` (Redis) |
 | `setup/` | the setup script, the schema and the permissions |
 | `Dockerfile` | the image the template runs: Node 22 on Alpine, pinned by digest, non-root, port 8080 |
