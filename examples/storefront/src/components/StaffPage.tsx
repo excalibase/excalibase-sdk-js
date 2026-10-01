@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSession } from "../hooks/session";
 import { money } from "../lib/money";
@@ -98,6 +98,9 @@ function Inventory() {
 function InventoryRow({ product, onSave }: { product: Product; onSave: (change: ProductChange) => void }) {
   const [price, setPrice] = useState(String(product.price));
   const [stock, setStock] = useState(String(product.stock));
+  // Shown at once; the refetch after the save confirms it.
+  const [active, setActive] = useState(product.active);
+  useEffect(() => setActive(product.active), [product.active]);
   const commit = () => {
     const change: ProductChange = {};
     if (Number(price) !== Number(product.price) && Number(price) >= 0) change.price = Number(price);
@@ -110,7 +113,8 @@ function InventoryRow({ product, onSave }: { product: Product; onSave: (change: 
       <td className="p-3"><input className="input w-24" value={price} onChange={(e) => setPrice(e.target.value)} onBlur={commit} data-testid="price" /></td>
       <td className="p-3"><input className="input w-20" value={stock} onChange={(e) => setStock(e.target.value)} onBlur={commit} data-testid="stock" /></td>
       <td className="p-3">
-        <input type="checkbox" checked={product.active} onChange={(e) => onSave({ active: e.target.checked })} data-testid="active" />
+        <input type="checkbox" checked={active} data-testid="active"
+          onChange={(e) => { setActive(e.target.checked); onSave({ active: e.target.checked }); }} />
       </td>
     </tr>
   );
