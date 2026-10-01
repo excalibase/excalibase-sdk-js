@@ -1,17 +1,12 @@
+/// <reference types="vitest" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// Vite proxies /graphql + /api/v1 to excalibase-graphql at :10004 so the
-// browser sees a same-origin URL — no CORS preflight needed for PATCH
-// (cart checkout, admin inventory edits).
+// `npm run dev` serves the SPA on :5176. In development the project comes from
+// VITE_EXCALIBASE_* variables (see README); in the container, from /config.js.
 export default defineConfig({
   plugins: [react()],
-  server: {
-    port: 5176,
-    host: true,
-    proxy: {
-      "/graphql": { target: "http://localhost:10004", changeOrigin: true },
-      "/api/v1":  { target: "http://localhost:10004", changeOrigin: true },
-    },
-  },
+  server: { port: 5176, host: true },
+  preview: { port: 5176 },
+  test: { include: ["src/**/*.test.ts"], environment: "node" },
 });

@@ -1,86 +1,82 @@
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Header } from "./components/Header";
-import { ProductGrid } from "./components/ProductGrid";
-import { ProductDetail } from "./components/ProductDetail";
 import { CartDrawer } from "./components/CartDrawer";
-import { OrdersPanel } from "./components/OrdersPanel";
-import { AdminPanel } from "./components/AdminPanel";
+import { Catalog } from "./components/Catalog";
 import { Footer } from "./components/Footer";
-import { CartProvider } from "./hooks/cart";
-import { IDENTITIES, setIdentity, type DemoIdentity } from "./lib/client";
+import { Header } from "./components/Header";
+import { OrdersPage } from "./components/OrdersPage";
+import { ProductPage } from "./components/ProductPage";
+import { SignInDialog } from "./components/SignInDialog";
+import { StaffPage } from "./components/StaffPage";
+import { Toasts, useToasts } from "./components/Toasts";
+import { useSession } from "./hooks/session";
+import { watchOrders } from "./lib/realtime";
 
 export type View =
   | { kind: "catalog"; categoryId: number | null }
   | { kind: "product"; id: number }
   | { kind: "orders" }
-  | { kind: "admin" };
+  | { kind: "staff" };
 
 export default function App() {
+  const { role, session, config } = useSession();
   const queryClient = useQueryClient();
-  const [identity, setActiveIdentity] = useState<DemoIdentity>(IDENTITIES[0]);
+  const toasts = useToasts();
   const [view, setView] = useState<View>({ kind: "catalog", categoryId: null });
   const [cartOpen, setCartOpen] = useState(false);
+  const [signInOpen, setSignInOpen] = useState(false);
+  const token = session?.accessToken ?? null;
 
-  function handleIdentityChange(next: DemoIdentity) {
-    setIdentity(next);
-    setActiveIdentity(next);
-    queryClient.invalidateQueries();
-    // Anon can't view orders/admin — bounce them to catalog.
-    if (next.key === "anon" && (view.kind === "orders" || view.kind === "admin")) {
-      setView({ kind: "catalog", categoryId: null });
-    }
-    // Non-admin can't view admin panel.
-    if (next.pgRole !== "app_admin" && view.kind === "admin") {
-      setView({ kind: "catalog", categoryId: null });
-    }
-  }
-
+  // Every role refetches everything when the caller changes: what the same
+  // queries return depends on who asks.
   useEffect(() => {
-    setIdentity(identity);
+    void queryClient.invalidateQueries();
+    if (role === "anon" && view.kind !== "catalog" && view.kind !== "product") setView({ kind: "catalog", categoryId: null });
+    if (role !== "staff" && view.kind === "staff") setView({ kind: "catalog", categoryId: null });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [token]);
+
+  // Live order updates for signed-in callers (anon has no orders permission,
+  // so the engine would refuse the subscription).
+  useEffect(() => {
+    if (!token) return undefined;
+    return watchOrders(config, token, (change) => {
+      void queryClient.invalidateQueries({ queryKey: ["orders"] });
+      if (change.operation === "UPDATE" && change.row.status) {
+        toasts.push(`Order #${change.row.id} is now ${change.row.status}`);
+      } else if (change.operation === "INSERT" && role === "staff") {
+        toasts.push(`New order #${change.row.id}${change.row.customer_email ? ` from ${change.row.customer_email}` : ""}`);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, config]);
 
   return (
-    <CartProvider>
-      <div className="min-h-screen flex flex-col bg-slate-50">
-        <Header
-          identity={identity}
-          view={view}
-          onIdentityChange={handleIdentityChange}
-          onNavigate={setView}
-          onCartOpen={() => setCartOpen(true)}
-        />
-        <main className="flex-1">
-          {view.kind === "catalog" && (
-            <ProductGrid
-              identity={identity}
-              categoryId={view.categoryId}
-              onCategoryChange={cid => setView({ kind: "catalog", categoryId: cid })}
-              onProductClick={id => setView({ kind: "product", id })}
-            />
-          )}
-          {view.kind === "product" && (
-            <ProductDetail
-              productId={view.id}
-              identity={identity}
-              onBack={() => setView({ kind: "catalog", categoryId: null })}
-            />
-          )}
-          {view.kind === "orders" && (
-            <OrdersPanel identity={identity} />
-          )}
-          {view.kind === "admin" && identity.pgRole === "app_admin" && (
-            <AdminPanel identity={identity} />
-          )}
-        </main>
-        <Footer identity={identity} />
-        <CartDrawer
-          open={cartOpen}
-          onClose={() => setCartOpen(false)}
-          identity={identity}
-        />
-      </div>
-    </CartProvider>
+    <div className="min-h-screen flex flex-col">
+      <Header view={view} onNavigate={setView} onCartOpen={() => setCartOpen(true)} onSignIn={() => setSignInOpen(true)} />
+      <main className="flex-1">
+        {view.kind === "catalog" && (
+          <Catalog
+            categoryId={view.categoryId}
+            onCategoryChange={(categoryId) => setView({ kind: "catalog", categoryId })}
+            onOpen={(id) => setView({ kind: "product", id })}
+          />
+        )}
+        {view.kind === "product" && (
+          <ProductPage
+            productId={view.id}
+            onBack={() => setView({ kind: "catalog", categoryId: null })}
+            onSignIn={() => setSignInOpen(true)}
+            onAdded={() => setCartOpen(true)}
+          />
+        )}
+        {view.kind === "orders" && <OrdersPage />}
+        {view.kind === "staff" && role === "staff" && <StaffPage />}
+      </main>
+      <Footer />
+      <CartDrawer open={cartOpen} onClose={() => setCartOpen(false)} onOrdered={() => setView({ kind: "orders" })} />
+      <SignInDialog open={signInOpen} onClose={() => setSignInOpen(false)} />
+      <Toasts toasts={toasts.items} />
+    </div>
   );
 }

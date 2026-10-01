@@ -1,0 +1,34 @@
+name: Storefront example
+
+# The storefront example (examples/storefront) has its own package: its unit
+# tests, type check, build and container image are checked here, apart from the
+# SDK's own CI.
+on:
+  push:
+    branches: [main]
+    paths: ["examples/storefront/**", ".github/workflows/storefront-example.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["examples/storefront/**", ".github/workflows/storefront-example.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/storefront
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: examples/storefront/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Container image builds
+        run: docker build -t storefront-demo:ci .

@@ -1,116 +1,103 @@
-# `@excalibase/sdk` — Storefront Demo
+# Storefront: a small store built on Excalibase
 
-> **Not runnable right now.** This example ran against an engine demo stack
-> (`make demo-*` in excalibase-graphql) that relied on Postgres role switching.
-> The engine dropped role switching for Hasura-style API permissions, and that
-> stack was removed; the example has to be ported to API permissions before it
-> runs again. See excalibase-graphql `docs/features/permissions.md`.
+A working shop, "Larch & Co.", that uses an Excalibase project end to end and
+runs on the platform's Containers. It is the store shown in the Excalibase demo
+videos.
 
-
-Shopify-style storefront on the ecommerce schema, demonstrating
-`@excalibase/sdk` with full Postgres role switching + RLS. Anyone can
-browse the catalog; signing in unlocks the cart and "My orders"; the
-admin role gets an inventory editor.
-
-| Identity | Catalog | Cart / checkout | My orders | Admin inventory |
-|---|---|---|---|---|
-| Guest (anon) | ✓ | "no INSERT grant" hint | — | — |
-| Alice / Carol | ✓ | ✓ — own customer_id only | ✓ — RLS-filtered to own | — |
-| Inventory admin | ✓ | ✓ | sees ALL customers' orders | ✓ — `PATCH /product_variants` |
-
-The footer pill shows the **resolved Postgres role** from a live
-`SELECT current_user FROM shopify.whoami_view` round-trip.
-
-## What's in here
-
-| File | Role |
+| Who | Sees and does |
 |---|---|
-| `src/App.tsx` | Top-level routing (`catalog / product / orders / admin`) + identity handler |
-| `src/lib/client.ts` | SDK wiring + four demo identities (projectId="shopify") |
-| `src/lib/queries.ts` | GraphQL documents (products, my orders, admin orders, whoami) |
-| `src/hooks/cart.tsx` | In-memory cart context |
-| `src/components/Header.tsx` | Logo, nav, search, cart, identity dropdown |
-| `src/components/ProductGrid.tsx` | Hero + category filter + product grid |
-| `src/components/ProductDetail.tsx` | Variant picker, reviews, add-to-cart (auth-gated) |
-| `src/components/CartDrawer.tsx` | Slide-in cart, checkout via `POST /orders` + `/order_items` |
-| `src/components/OrdersPanel.tsx` | "My orders" — RLS-filtered list per customer |
-| `src/components/AdminPanel.tsx` | Inventory editor + cross-customer order list |
-| `src/components/Footer.tsx` | Live `whoami_view` role pill |
-| `scripts/sign-tokens.mjs` | Signs the four demo JWTs (projectId="shopify") |
+| Guest (`anon`, no token) | browses the catalog and the best sellers; no cart, no orders: those tables do not exist for `anon` |
+| Customer (`user`, a signed-in account) | a cart and orders that are only their own; places an order with its line items in one mutation; sees its status change live |
+| Staff (the custom role `staff`) | every order, with the customer's email; changes order status; edits prices, stock and what is on sale; adds products |
 
-## Setup
+What it uses:
 
-This demo expects `excalibase-graphql` checked out next to
-`excalibase-sdk-js`. The graphql repo provides the docker stack, RLS
-policies (`init-shopify-rls.sql`), and the test JWT signing key.
+- **API permissions** (one rule per table, role and operation, the Hasura
+  model): the same GraphQL documents run for every role and return what that
+  role may see. Presets fill `customer_id` and `customer_email` from the token,
+  so a customer cannot write rows for someone else.
+- **A custom role** given to an account through the project's end-user role
+  API (`staff`, allowed to act as `user` too).
+- **A nested insert**: an order and its line items in one `createPublicOrders`
+  mutation. Database triggers price each line, take stock (an order that would
+  oversell fails as a whole) and total the order.
+- **A tracked function**: `best_sellers(top)` ranks products by units sold. It
+  is `STABLE`, so it is a query every role that reads products may call, and
+  its rows pass through the caller's own products permission (guests never see
+  a product that is not on sale, even if it sells).
+- **Realtime**: `publicOrdersChanges` over the project's GraphQL websocket. A
+  customer's order list updates when staff ship the order; staff see new orders
+  arrive. Each change reaches only callers whose permission covers the row.
+- **End-user auth** through `@excalibase/sdk` (sign up, sign in, session kept
+  and refreshed).
+- **Containers**: the store's own server runs as an app next to the project,
+  and counts product views ("Trending now") in a Redis that only the project's
+  apps can reach, over the project's private network.
+
+## Run it on the platform
+
+1. In Studio, open a project with a Postgres database, go to **Containers →
+   Templates** and deploy **Storefront demo**. It creates two apps: `storefront`
+   (public, on its own URL) and `redis` (internal), and turns on the private
+   network. Or through the API:
+   `POST /api/projects/{projectId}/app-templates/storefront-demo/deploy` with
+   `{"confirmPrivateNetwork": true}`.
+2. Run the setup script against the project. It needs a personal access token
+   (`excb_…`) of a Developer on the project, made with `POST /api/auth/tokens`
+   `{"name": "storefront setup"}` while signed in to the control plane:
+
+   ```bash
+   cd examples/storefront && npm ci
+   EXCALIBASE_API=https://<studio host>/api \
+   EXCALIBASE_TOKEN=<access token> \
+   EXCALIBASE_DATA_URL=https://<data plane host> \
+   PROJECT_ID=<project id> \
+   npm run setup
+   ```
+
+   Everything goes through the platform's APIs: the schema and sample products
+   (`/api/schema/{id}/ddl`), the permissions and the tracked function
+   (`/api/provision/{id}/permissions`, `/tracked-functions`), realtime on
+   `orders`, a publishable key, CORS for the store's URL, three demo accounts
+   (`alice@` and `bob@` customers, `sam@` staff, under `example.test` unless
+   `DEMO_EMAIL_DOMAIN` says otherwise; one password, from `DEMO_PASSWORD` or
+   generated and printed), and the store's `EXCALIBASE_*` variables, after which
+   the store is redeployed. Running it again is safe: what exists is kept.
+   The script also ships in the store's image, so no checkout is needed:
+   `docker run --rm -e EXCALIBASE_API=… -e EXCALIBASE_TOKEN=… -e EXCALIBASE_DATA_URL=… -e PROJECT_ID=… <the template's image> node setup/setup.mjs`.
+3. Open the store's URL (printed at the end, and shown on the app in Studio).
+
+The permissions are in [`setup/permissions.mjs`](setup/permissions.mjs) and the
+schema in [`setup/schema.sql`](setup/schema.sql).
+
+## Run it locally against a project
 
 ```bash
-# In excalibase-graphql:
-make demo-shop
-# stack up + tokens signed + Vite dev server at http://localhost:5176
+cd examples/storefront && npm ci
+# CORS: let the dev server's origin call the project
+EXTRA_ORIGINS=http://localhost:5176 STOREFRONT_APP=none EXCALIBASE_API=... EXCALIBASE_TOKEN=... \
+  EXCALIBASE_DATA_URL=... PROJECT_ID=... npm run setup
+VITE_EXCALIBASE_URL=<data plane URL> VITE_EXCALIBASE_PROJECT_ID=<project id> \
+VITE_EXCALIBASE_ORG_SLUG=<org slug> VITE_EXCALIBASE_PUBLISHABLE_KEY=<publishable key> npm run dev
+# http://localhost:5176 ("Trending now" needs the server and a REDIS_URL: npm run build && npm start)
 ```
 
-Step by step:
+## How the code is laid out
 
-```bash
-cd ~/Documents/duk/excalibase-graphql
-make demo-up
+| Path | What |
+|---|---|
+| `src/lib/client.ts` | the one `@excalibase/sdk` client |
+| `src/lib/platform-fetch.ts` | the SDK takes one base URL; this moves GraphQL, REST and functions calls to the project's paths on the data plane (`/{projectId}/graphql`), while auth stays at `/auth/{org}/{project}` |
+| `src/lib/store.ts` | every query and mutation the store makes |
+| `src/lib/realtime.ts` | the order subscription (`graphql-ws`; the token goes in `connection_init`) |
+| `server/` | the container's server: the SPA, `/config.js` (the project, from the app's variables), `/api/views` and `/api/trending` (Redis) |
+| `setup/` | the setup script, the schema and the permissions |
+| `Dockerfile` | the image the template runs: Node 22 on Alpine, pinned by digest, non-root, port 8080 |
 
-cd ~/Documents/duk/excalibase-sdk-js/examples/storefront
-npm install
-npm run sign-tokens
-npm run dev
-# → http://localhost:5176
-```
+`npm test` runs the unit tests (server, setup helpers, SPA helpers).
 
-## What to look at
+## Not shown here
 
-1. **Browse as guest** — full product grid renders with reviews +
-   ratings. Click any product → variant picker, reviews — but the
-   add-to-cart button is replaced by an inline RLS-explanation hint.
-
-2. **Switch to Alice Chen** — add-to-cart unlocks. Add a couple of
-   items, click the cart icon (top right), watch the cart slide in.
-   Hit "Checkout as Alice Chen" — `POST /orders` with
-   `customer_id = (request.user_id)` succeeds because RLS WITH CHECK
-   matches.
-
-3. **Click "My orders"** — see only Alice's orders. Switch to Carol —
-   the list changes; she sees only HER orders (server-filtered, not a
-   client query change).
-
-4. **Try a write that should fail** — open browser devtools and POST
-   `/orders` with `customer_id: 99` while signed in as Alice. The RLS
-   `WITH CHECK` rejects the row.
-
-5. **Switch to Inventory admin** — the "Admin" tab appears. Edit a
-   stock quantity → `PATCH /product_variants` succeeds because the
-   admin role has full RW. The "All orders (cross-customer)" tab shows
-   every customer's orders — admin policy `FOR ALL ... USING (true)`.
-
-6. **Watch the footer** — pill flips between `app_anon` (gray),
-   `app_authenticated` (blue), `app_admin` (red).
-
-## Troubleshooting
-
-**`Could not read demo signing key`** — set `EXCALIBASE_DEMO_KEY` or
-check out `excalibase-graphql` next to `excalibase-sdk-js`.
-
-**Catalog empty / "permission denied"** — the shopify-rls init script
-might not have run. Re-deploy with a clean volume:
-```bash
-cd ~/Documents/duk/excalibase-graphql
-docker compose -f e2e/study-cases/docker-compose.study-cases.yml down -v sc-shopify-postgres
-make demo-up
-```
-
-**Checkout fails for Alice** — the customer row alignment between JWT
-`userId` and `shopify.customers.id` may have drifted. Verify in
-`init-shopify-rls.sql` that customers 1, 2, 3 are seeded with explicit
-IDs matching the demo's userIds.
-
-## Companion
-
-`examples/jira-board` is the same SDK + role-switching pattern, but on
-the kanban schema shaped like Jira/Linear — drag-drop board, issue
-detail drawer, comment threads.
+- Product pictures are part of the app, not uploads: uploading through
+  `db.storage.uploadFile` needs the project's functions runtime to reach
+  Storage, which it does not on the platform yet.
