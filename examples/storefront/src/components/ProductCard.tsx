@@ -1,11 +1,14 @@
 import type { Product } from "../lib/types";
 import { money } from "../lib/money";
+import { useImageUrl } from "../hooks/images";
 
-export function ProductArt({ product, className = "" }: { product: Pick<Product, "name" | "image_url">; className?: string }) {
+// The product's picture from the project's Storage, or its name until there is one.
+export function ProductArt({ product, className = "" }: { product: Pick<Product, "name" | "image_id">; className?: string }) {
+  const src = useImageUrl(product.image_id);
   return (
     <div className={`bg-stone-100 grid place-items-center overflow-hidden ${className}`}>
-      {product.image_url ? (
-        <img src={product.image_url} alt={product.name} className="w-full h-full object-cover" />
+      {src ? (
+        <img src={src} alt={product.name} className="w-full h-full object-cover" data-testid="product-image" />
       ) : (
         <span className="text-stone-400 text-sm">{product.name}</span>
       )}

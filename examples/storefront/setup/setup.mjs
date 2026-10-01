@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // Sets up a project for the storefront, entirely through the platform's APIs:
 // tables and sample data, permissions per role, the tracked function,
-// realtime on orders, a publishable key, CORS for the app's origin, three demo
-// accounts (two customers and one staff member with the custom role "staff"),
-// and the app's variables, after which the app is redeployed.
+// realtime on orders, the store's functions (product picture uploads, staff
+// only, and picture links), a publishable key, CORS for the app's origin, three
+// demo accounts (two customers and one staff member with the custom role
+// "staff"), the sample pictures uploaded to Storage as the staff account, and
+// the app's variables, after which the app is redeployed.
 //
 //   EXCALIBASE_API=https://admin.example.com/api \
 //   EXCALIBASE_TOKEN=<personal access token> \
@@ -12,7 +14,8 @@
 //
 // Optional: STOREFRONT_APP (default storefront; "none" skips the app steps),
 // EXCALIBASE_AUTH_URL (where this script reaches end-user auth, default the
-// data URL), EXTRA_ORIGINS (comma separated, e.g. http://localhost:5176),
+// data URL), EXCALIBASE_DATA_API_URL (where it reaches the project's GraphQL
+// and functions, default the data URL), EXTRA_ORIGINS (comma separated, e.g. http://localhost:5176),
 // DEMO_PASSWORD (else one is generated), DEMO_EMAIL_DOMAIN (default
 // example.test), SETUP_OUT (write the result as JSON to this file).
 import { randomBytes } from 'node:crypto';
@@ -20,6 +23,8 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { literalValue, mergeAppEnv, originOf, withOrigins } from './app-env.mjs';
+import { functionDeploys } from './functions.mjs';
+import { seedProductImages, storageOrigin } from './images.mjs';
 import { PERMISSIONS, REALTIME_TABLES, TRACKED_FUNCTIONS } from './permissions.mjs';
 import { controlPlane, endUserAuth } from './platform.mjs';
 
@@ -41,6 +46,7 @@ function readConfig() {
     token: required('EXCALIBASE_TOKEN'),
     dataUrl,
     authUrl: (process.env.EXCALIBASE_AUTH_URL || dataUrl).replace(/\/$/, ''),
+    dataApiUrl: (process.env.EXCALIBASE_DATA_API_URL || dataUrl).replace(/\/$/, ''),
     projectId: required('PROJECT_ID'),
     appName: process.env.STOREFRONT_APP || 'storefront',
     extraOrigins: (process.env.EXTRA_ORIGINS || '').split(',').map((o) => o.trim()).filter(Boolean),
@@ -84,6 +90,32 @@ async function applyPermissions(api, projectId) {
     await api.put(`/projects/${projectId}/realtime/tables/${schema}/${table}`);
     log(`realtime: ${schema}.${table} on`);
   }
+}
+
+// Create-or-replace: deploying an id again replaces that function.
+async function deployFunctions(api, projectId) {
+  for (const deploy of await functionDeploys()) {
+    await api.post(`/projects/${projectId}/functions/`, deploy);
+    log(`function: ${deploy.id} deployed`);
+  }
+}
+
+// The sample pictures go to Storage the way staff upload them in the store.
+async function seedPictures(auth, config, key) {
+  const sam = config.accounts.find((account) => account.role === 'staff');
+  let session;
+  try {
+    session = await auth.signIn({ email: sam.email, password: config.password });
+  } catch (err) {
+    if (err.status === 401 || err.status === 400) {
+      throw new Error(`cannot sign in as ${sam.email} to upload the sample pictures: run with DEMO_PASSWORD set to the demo accounts' password`);
+    }
+    throw err;
+  }
+  const target = { dataUrl: config.dataApiUrl, projectId: config.projectId, publishableKey: key, token: session.accessToken };
+  const seeded = await seedProductImages(target, (file) => readFile(path.join(HERE, 'images', file)));
+  log(`pictures: ${seeded} uploaded to Storage as ${sam.email}`);
+  return storageOrigin({ ...target, token: null });
 }
 
 async function ensureAccounts(api, auth, projectId, config) {
@@ -165,17 +197,20 @@ async function main() {
 
   await applySchema(api, config.projectId);
   await applyPermissions(api, config.projectId);
+  await deployFunctions(api, config.projectId);
   await ensureAccounts(api, auth, config.projectId, config);
 
   const app = config.appName === 'none' ? null : await findApp(api, config.projectId, config.appName);
   const key = await publishableKey(api, config.projectId, app);
   await allowOrigins(api, config.projectId, [...(app?.url ? [originOf(app.url)] : []), ...config.extraOrigins]);
+  const pictures = await seedPictures(auth, config, key);
   if (app) {
     await configureAndDeploy(api, config.projectId, app.id, {
       EXCALIBASE_URL: config.dataUrl,
       EXCALIBASE_PROJECT_ID: config.projectId,
       EXCALIBASE_ORG_SLUG: info.orgSlug,
       EXCALIBASE_PUBLISHABLE_KEY: key,
+      ...(pictures ? { EXCALIBASE_STORAGE_ORIGIN: pictures } : {}),
     });
   }
 
@@ -185,6 +220,7 @@ async function main() {
     dataUrl: config.dataUrl,
     appUrl: app?.url ?? null,
     publishableKey: key,
+    storageOrigin: pictures,
     accounts: config.accounts.map(({ key: name, email, role }) => ({ name, email, role: role ?? 'user' })),
     password: config.password,
   };

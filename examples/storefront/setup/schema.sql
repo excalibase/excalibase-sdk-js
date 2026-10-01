@@ -14,7 +14,8 @@ CREATE TABLE products (
   description  text NOT NULL DEFAULT '',
   price        numeric(10,2) NOT NULL CHECK (price >= 0),
   stock        integer NOT NULL DEFAULT 0 CHECK (stock >= 0),
-  image_url    text,
+  -- The picture: a storage id in the project's Storage (staff upload it).
+  image_id     text,
   active       boolean NOT NULL DEFAULT true,
   created_at   timestamptz NOT NULL DEFAULT now()
 );
@@ -101,16 +102,16 @@ INSERT INTO categories (name, slug) VALUES
   ('Coffee', 'coffee'),
   ('Carry', 'carry');
 
-INSERT INTO products (category_id, name, description, price, stock, image_url) VALUES
-  (1, 'Walnut desk lamp', 'Warm 2700K light on a solid walnut arm. Dimmable, USB-C powered.', 89.00, 14, '/products/lamp.svg'),
-  (1, 'Felt desk mat', 'Merino felt, 90 x 40 cm. Quiet mouse, warm wrists.', 39.00, 40, '/products/mat.svg'),
-  (1, 'Brass pen', 'Machined brass, refillable, gets better with age.', 29.00, 25, '/products/pen.svg'),
-  (2, 'Pour-over kettle', 'Gooseneck, 0.9 L, holds temperature to the degree.', 119.00, 8, '/products/kettle.svg'),
-  (2, 'Ceramic mug', 'Hand-glazed stoneware, 350 ml. Every one slightly different.', 24.00, 60, '/products/mug.svg'),
-  (2, 'House blend, 250 g', 'Medium roast: cocoa, hazelnut, a little cherry.', 16.00, 120, '/products/beans.svg'),
-  (3, 'Canvas tote', 'Heavy waxed canvas with a leather strap.', 49.00, 30, '/products/tote.svg'),
-  (3, 'Laptop sleeve', 'Wool felt with a magnetic flap, fits 14 inches.', 59.00, 18, '/products/sleeve.svg');
+INSERT INTO products (category_id, name, description, price, stock) VALUES
+  (1, 'Walnut desk lamp', 'Warm 2700K light on a solid walnut arm. Dimmable, USB-C powered.', 89.00, 14),
+  (1, 'Felt desk mat', 'Merino felt, 90 x 40 cm. Quiet mouse, warm wrists.', 39.00, 40),
+  (1, 'Brass pen', 'Machined brass, refillable, gets better with age.', 29.00, 25),
+  (2, 'Pour-over kettle', 'Gooseneck, 0.9 L, holds temperature to the degree.', 119.00, 8),
+  (2, 'Ceramic mug', 'Hand-glazed stoneware, 350 ml. Every one slightly different.', 24.00, 60),
+  (2, 'House blend, 250 g', 'Medium roast: cocoa, hazelnut, a little cherry.', 16.00, 120),
+  (3, 'Canvas tote', 'Heavy waxed canvas with a leather strap.', 49.00, 30),
+  (3, 'Laptop sleeve', 'Wool felt with a magnetic flap, fits 14 inches.', 59.00, 18);
 
 -- A product that is not on sale: only staff see it.
-INSERT INTO products (category_id, name, description, price, stock, image_url, active) VALUES
-  (1, 'Prototype monitor stand', 'Not released yet.', 149.00, 3, '/products/stand.svg', false);
+INSERT INTO products (category_id, name, description, price, stock, active) VALUES
+  (1, 'Prototype monitor stand', 'Not released yet.', 149.00, 3, false);
