@@ -71,7 +71,9 @@ export async function placeOrder(db: DbClient, items: CartItem[], note: string):
   const data = await db.graphql.mutation<{ createPublicOrders: { id: number } }>(`mutation {
     createPublicOrders(input: { note: ${str(note)}, publicOrderItems: { data: [${lines}] } }) { id }
   }`);
-  await removeFromCart(db, items.map((item) => item.id));
+  // The order stands once created; a cart that fails to clear must not read
+  // as a failed order (a retry would order twice), so it is cleared best effort.
+  await removeFromCart(db, items.map((item) => item.id)).catch((err) => console.warn("cart not cleared", err));
   return data.createPublicOrders.id;
 }
 
