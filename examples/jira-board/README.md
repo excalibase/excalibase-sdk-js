@@ -1,5 +1,12 @@
 # `@excalibase/sdk` — Jira-style Board Demo
 
+> **Not runnable right now.** This example ran against an engine demo stack
+> (`make demo-*` in excalibase-graphql) that relied on Postgres role switching.
+> The engine dropped role switching for Hasura-style API permissions, and that
+> stack was removed; the example has to be ported to API permissions before it
+> runs again. See excalibase-graphql `docs/features/permissions.md`.
+
+
 Polished kanban board styled after Jira / Linear, demonstrating
 `@excalibase/sdk` against the kanban schema with full Postgres role
 switching + RLS. Drag-and-drop cards across columns triggers REST

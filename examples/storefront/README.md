@@ -1,5 +1,12 @@
 # `@excalibase/sdk` — Storefront Demo
 
+> **Not runnable right now.** This example ran against an engine demo stack
+> (`make demo-*` in excalibase-graphql) that relied on Postgres role switching.
+> The engine dropped role switching for Hasura-style API permissions, and that
+> stack was removed; the example has to be ported to API permissions before it
+> runs again. See excalibase-graphql `docs/features/permissions.md`.
+
+
 Shopify-style storefront on the ecommerce schema, demonstrating
 `@excalibase/sdk` with full Postgres role switching + RLS. Anyone can
 browse the catalog; signing in unlocks the cart and "My orders"; the
