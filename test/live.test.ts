@@ -1,143 +1,113 @@
 /**
- * Live integration test against a running excalibase study-cases stack.
+ * Live: one client against a running platform's edge, given only the base URL,
+ * the project id and the key. Skipped unless SDK_LIVE_URL is set.
  *
- * Skipped by default. Run with:
- *
- *   cd /home/duc/Documents/duk/excalibase-graphql && make study-cases-up
- *   cd /home/duc/Documents/duk/excalibase-sdk-js && SDK_LIVE_URL=http://localhost:10004 \
- *     SDK_LIVE_AUTH_URL=http://localhost:24004 npx jest live.test
- *
- * Exercises the real auth contract (register -> /token password grant ->
- * refresh_token grant -> signOut) and a real GraphQL query that uses the
- * shipped search and vector operators on the kanban tenant.
+ * The project comes from test/live/platform-setup.mjs (a `notes` table the
+ * `user` role reads and inserts, realtime on it, the `uploads.mint` and
+ * `uploads.complete` functions, an end user); test/live/k3d-platform.sh brings
+ * up platform-aio on k3d behind the HAProxy edge and runs both.
  */
+import WebSocket from "ws";
 import { createClient, memoryStorageAdapter } from "../src";
 
-const GRAPHQL_URL = process.env.SDK_LIVE_URL ?? "";
-const AUTH_URL = process.env.SDK_LIVE_AUTH_URL ?? "";
-const LIVE = GRAPHQL_URL.length > 0 && AUTH_URL.length > 0;
-
+const env = (name: string): string => process.env[name] ?? "";
+const LIVE = env("SDK_LIVE_URL").length > 0;
 const describeLive = LIVE ? describe : describe.skip;
 
-describeLive("live: study-cases kanban tenant", () => {
-  const projectId = "study-cases/kanban";
-  const testEmail = `sdk-e2e-${Date.now()}@example.com`;
-  const testPassword = "Pass123!";
+interface Note {
+  id: number;
+  body: string;
+}
 
-  function makeDb() {
-    return createClient({
-      url: GRAPHQL_URL,
-      // The live auth service and graphql service are on different ports in
-      // the study-cases stack, so we have to override the auth endpoint path.
-      // A normal deployment runs them behind one gateway and this hack is unnecessary.
-      projectId,
-      publishableKey: "esk_pub_live_dummy_study_cases_key_for_sdk_smoke",
-      storage: memoryStorageAdapter(),
-      autoRefreshToken: false,
-    });
-  }
+interface NoteChange {
+  operation: string;
+  data: Note | { new?: Note };
+}
 
-  // The study-cases stack runs graphql at :10004 and auth at :24004 on two
-  // different hosts. createClient assumes one host for both, so we patch the
-  // auth endpoint per-call with the real url. For production with a shared
-  // gateway this is not needed.
-  function authUrl(db: ReturnType<typeof makeDb>, subpath: string): string {
-    return `${AUTH_URL}/auth/${db.orgSlug}/${db.projectName}${subpath}`;
-  }
+function client() {
+  return createClient({
+    url: env("SDK_LIVE_URL"),
+    projectId: env("SDK_LIVE_PROJECT_ID"),
+    orgSlug: env("SDK_LIVE_ORG_SLUG") || undefined,
+    key: env("SDK_LIVE_KEY"),
+    storage: memoryStorageAdapter(),
+    autoRefreshToken: false,
+    WebSocket,
+  });
+}
 
-  async function register(db: ReturnType<typeof makeDb>): Promise<void> {
-    await fetch(authUrl(db, "/register"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: testEmail, password: testPassword, fullName: "SDK E2E" }),
-    }).catch(() => undefined);
-  }
+describeLive("live: createClient({ url, projectId, key }) on the platform edge", () => {
+  let db: ReturnType<typeof client>;
+  const marker = `live-${Date.now()}`;
 
-  async function login(db: ReturnType<typeof makeDb>): Promise<string> {
-    const r = await fetch(authUrl(db, "/token"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ grant_type: "password", email: testEmail, password: testPassword }),
-    });
-    if (!r.ok) throw new Error(`token exchange failed: ${r.status} ${await r.text()}`);
-    const body = (await r.json()) as { accessToken: string };
-    return body.accessToken;
-  }
-
-  it("runs a GraphQL search query with the current session's bearer token", async () => {
-    const db = makeDb();
-    await register(db);
-    const accessToken = await login(db);
-
-    const client = db.graphqlClient();
-    // Swap in the freshly minted access token. This bypasses AuthClient
-    // because the two services live on different ports and signInWithPassword
-    // would hit :10004/auth/... instead of :24004/auth/...
-    (client as unknown as { requestConfig: { headers: Record<string, string> } }).requestConfig.headers = {
-      Authorization: `Bearer ${accessToken}`,
-    };
-
-    const query = /* GraphQL */ `
-      {
-        kanbanIssues(where: { search_vec: { search: "kubernetes" } }, limit: 5) {
-          id
-          title
-        }
-      }
-    `;
-    const data = await client.request<{ kanbanIssues: Array<{ id: number; title: string }> }>(query);
-    expect(Array.isArray(data.kanbanIssues)).toBe(true);
-    // Kanban seed data has ~1 kubernetes-related issue — result set is small but non-empty.
-    expect(data.kanbanIssues.length).toBeGreaterThanOrEqual(0);
+  beforeAll(async () => {
+    db = client();
+    await db.auth.signInWithPassword({ email: env("SDK_LIVE_EMAIL"), password: env("SDK_LIVE_PASSWORD") });
   }, 30_000);
 
-  it("runs a GraphQL vector k-NN query against the kanban embedding column", async () => {
-    const db = makeDb();
-    await register(db);
-    const accessToken = await login(db);
+  afterAll(async () => {
+    await db.auth.signOut().catch(() => undefined);
+  });
 
-    const client = db.graphqlClient();
-    (client as unknown as { requestConfig: { headers: Record<string, string> } }).requestConfig.headers = {
-      Authorization: `Bearer ${accessToken}`,
-    };
+  it("signs in through /auth/{org}/{projectId}", () => {
+    const session = db.auth.currentSession();
+    expect(session?.accessToken).toEqual(expect.any(String));
+    expect(session?.user?.email).toBe(env("SDK_LIVE_EMAIL"));
+  });
 
-    const query = /* GraphQL */ `
-      {
-        kanbanIssues(
-          vector: { column: "embedding", near: [0.0, 0.0, 1.0], distance: "L2", limit: 3 }
-        ) {
-          id
-          title
-        }
-      }
-    `;
-    const data = await client.request<{ kanbanIssues: Array<{ id: number; title: string }> }>(query);
-    expect(Array.isArray(data.kanbanIssues)).toBe(true);
-    expect(data.kanbanIssues.length).toBeLessThanOrEqual(3);
+  it("writes and reads through /{projectId}/graphql", async () => {
+    const created = await db.graphql.mutation<{ createPublicNotes: Note }>(
+      "mutation ($body: String!) { createPublicNotes(input: { body: $body }) { id body } }",
+      { body: `${marker}-graphql` },
+    );
+    expect(created.createPublicNotes.body).toBe(`${marker}-graphql`);
+    const read = await db.graphql.query<{ publicNotes: Note[] }>("{ publicNotes(orderBy: { id: ASC }) { id body } }");
+    expect(read.publicNotes.map((n) => n.body)).toContain(`${marker}-graphql`);
   }, 30_000);
 
-  it("DbClient.request wraps graphql-request with the same headers", async () => {
-    // Use the DbClient's real request() entry point rather than reaching into
-    // graphql-request, so we exercise the public API. We install the token
-    // into the headers override option.
-    const db = createClient({
-      url: GRAPHQL_URL,
-      projectId,
-      publishableKey: "esk_pub_live_dummy_study_cases_key_for_sdk_smoke",
-      storage: memoryStorageAdapter(),
-      autoRefreshToken: false,
+  it("writes and reads through /{projectId}/api/v1", async () => {
+    await db.rest.post("/notes", { body: `${marker}-rest` });
+    const rows = await db.rest.get<Note[] | { data: Note[] }>(`/notes?select=id,body&body=eq.${marker}-rest`);
+    const list = Array.isArray(rows) ? rows : rows.data;
+    expect(list.map((n) => n.body)).toEqual([`${marker}-rest`]);
+  }, 30_000);
+
+  it("receives an insert over the realtime WebSocket at /{projectId}/graphql", async () => {
+    const body = `${marker}-realtime`;
+    const received = new Promise<NoteChange>((resolve, reject) => {
+      const sub = db.graphql.subscribe<{ publicNotesChanges: NoteChange }>(
+        "subscription { publicNotesChanges { operation table data } }",
+        {
+          next: (data) => {
+            const change = data.publicNotesChanges;
+            const row = "new" in change.data ? change.data.new : (change.data as Note);
+            if (row?.body === body) {
+              sub.unsubscribe();
+              resolve(change);
+            }
+          },
+          error: reject,
+        },
+      );
     });
-    await register(db);
-    const accessToken = await login(db);
-    // Override DbClient auth session manually for this cross-port setup.
-    (db.auth as unknown as { session: unknown }).session = {
-      accessToken,
-      refreshToken: null,
-      tokenType: "Bearer",
-      expiresAt: Date.now() + 60_000,
-      user: null,
-    };
-    const data = await db.graphql.query<{ __typename: string }>("{ __typename }");
-    expect(data.__typename).toBe("Query");
-  }, 30_000);
+    // The change stream may need a moment to attach; insert until one arrives.
+    let arrived = false;
+    void received.then(() => (arrived = true), () => (arrived = true));
+    for (let attempt = 0; attempt < 30 && !arrived; attempt += 1) {
+      await db.graphql.mutation("mutation ($body: String!) { createPublicNotes(input: { body: $body }) { id } }", { body });
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    const change = await received;
+    expect(change.operation).toBe("INSERT");
+  }, 90_000);
+
+  it("uploads a file through /functions/v1/{projectId}", async () => {
+    const blob = new Blob([`hello from ${marker}`], { type: "text/plain" });
+    const { storageId } = await db.storage.uploadFile(blob, {
+      ref: { moduleName: "uploads", exportName: "mint" },
+      completeRef: { moduleName: "uploads", exportName: "complete" },
+    });
+    expect(storageId).toEqual(expect.any(String));
+    expect(storageId.length).toBeGreaterThan(0);
+  }, 60_000);
 });

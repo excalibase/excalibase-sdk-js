@@ -30,6 +30,7 @@ export {
   type StorageAdapter,
 } from "./storage";
 export { FileStorageClient } from "./storage/client";
+export type { SubscriptionHandlers, WebSocketLike, WebSocketConstructor } from "./realtime";
 export type {
   FileStorageClientOptions,
   UploadMutationRef,

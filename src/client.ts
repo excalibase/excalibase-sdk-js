@@ -4,10 +4,20 @@ import { AuthError, ConfigError, NetworkError } from "./errors";
 import { FunctionsNamespace } from "./functions/namespace";
 import type { DefaultFunctions } from "./functions/types";
 import { GraphqlNamespace } from "./graphql-ns";
+import {
+  authUrl,
+  functionsUrl,
+  graphqlUrl,
+  realtimeUrl,
+  resolveProjectTarget,
+  restUrl,
+  type ProjectTarget,
+} from "./project";
 import { QueryBuilder, type RestDescriptor } from "./query-builder";
 import { RestNamespace } from "./rest-ns";
 import { defaultStorage, type StorageAdapter } from "./storage";
 import { FileStorageClient } from "./storage/client";
+import { resolveWebSocket, type WebSocketConstructor } from "./realtime";
 import type { CreateClientOptions, SchemaMeta, Session } from "./types";
 
 /**
@@ -46,10 +56,15 @@ export class DbClient<
   DB extends DatabaseShape = AnyDatabase,
   Functions = DefaultFunctions,
 > {
+  /** The platform's base URL. */
   readonly url: string;
+  /** The project's id: the path segment every service names it by. */
   readonly projectId: string;
+  /** Auth's org path segment (the project id unless `orgSlug` was given). */
   readonly orgSlug: string;
+  /** @deprecated The project id; kept for older callers. */
   readonly projectName: string;
+  /** The API key sent as `X-Excalibase-Publishable-Key` (publishable or, server-side, secret). */
   readonly publishableKey: string;
   readonly auth: AuthClient;
   readonly graphql: GraphqlNamespace;
@@ -57,7 +72,7 @@ export class DbClient<
   /**
    * Typed RPC namespace: `db.functions.<module>.<name>(args)`. The proxy
    * resolves `.<module>.<name>` to a POST against
-   * `${url}/functions/v1/${projectId}/${module}.${name}` with `{ args }`.
+   * `{url}/functions/v1/{projectId}/{module}.{name}` with `{ args }`.
    */
   readonly functions: Functions;
   /**
@@ -82,27 +97,22 @@ export class DbClient<
   readonly schema: SchemaMeta | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly extraHeaders: Record<string, string>;
+  private readonly target: ProjectTarget;
+  private readonly webSocketOption: unknown;
 
   constructor(opts: CreateClientOptions) {
-    validateOptions(opts);
-    this.url = stripTrailingSlash(opts.url);
-    this.projectId = opts.projectId;
-    // Phase 9b.H: support both slash-form (`{org}/{proj}` — legacy DbClient
-    // public surface) AND opaque ids (`proj-<10>` — what provisioning
-    // emits). For the opaque case both fields fall back to the full id so
-    // downstream consumers (e.g. authEndpoint()) still receive a
-    // well-formed string rather than `undefined`. Callers that rely on
-    // distinct org/project segments must continue using the slash form.
-    if (opts.projectId.includes("/")) {
-      const [orgSlug, projectName] = opts.projectId.split("/");
-      this.orgSlug = orgSlug!;
-      this.projectName = projectName!;
-    } else {
-      this.orgSlug = opts.projectId;
-      this.projectName = opts.projectId;
+    if (opts == null || typeof opts !== "object") {
+      throw new ConfigError("createClient requires an options object: { url, projectId, key }");
     }
-    this.publishableKey = opts.publishableKey;
+    this.target = resolveProjectTarget(opts);
+    this.publishableKey = resolveKey(opts);
+    this.url = this.target.url;
+    this.projectId = this.target.projectId;
+    this.orgSlug = this.target.orgSlug;
+    this.projectName = this.target.projectId;
+    this.webSocketOption = opts.WebSocket;
     this.tokenStorage = opts.storage ?? defaultStorage();
+    // Keyed as before (by the projectId option) so a stored session survives the upgrade.
     this.storageKey = opts.storageKey ?? `${DEFAULT_STORAGE_KEY}:${opts.projectId}`;
     this.schema = opts.schema;
     // Bind fetch to globalThis. Calling `globalThis.fetch` via a property
@@ -144,18 +154,34 @@ export class DbClient<
     });
   }
 
+  /** `{url}/{projectId}/graphql` */
   graphqlEndpoint(): string {
-    return `${this.url}/graphql`;
+    return graphqlUrl(this.target);
   }
 
+  /** `{url}/{projectId}/api/v1{path}` */
   restEndpoint(path: string): string {
-    const suffix = path.startsWith("/") ? path : `/${path}`;
-    return `${this.url}/api/v1${suffix}`;
+    return restUrl(this.target, path);
   }
 
+  /** `{url}/auth/{orgSlug}/{projectId}{subpath}` */
   authEndpoint(subpath: string): string {
-    const suffix = subpath.startsWith("/") ? subpath : `/${subpath}`;
-    return `${this.url}/auth/${this.orgSlug}/${this.projectName}${suffix}`;
+    return authUrl(this.target, subpath);
+  }
+
+  /** `{url}/functions/v1/{projectId}/{name}`, where name is `module.export` */
+  functionsEndpoint(name: string): string {
+    return functionsUrl(this.target, name);
+  }
+
+  /** `ws(s)://{host}/{projectId}/graphql`: GraphQL subscriptions (graphql-transport-ws). */
+  realtimeEndpoint(): string {
+    return realtimeUrl(this.target);
+  }
+
+  /** The WebSocket constructor subscriptions use: the `WebSocket` option, else the runtime's. */
+  webSocketConstructor(): WebSocketConstructor {
+    return resolveWebSocket(this.webSocketOption);
   }
 
   graphqlClient(): GraphQLClient {
@@ -271,50 +297,30 @@ export class DbClient<
   }
 }
 
-function validateOptions(opts: CreateClientOptions): void {
-  if (opts == null || typeof opts !== "object") {
-    throw new ConfigError("createClient requires an options object");
+function resolveKey(opts: CreateClientOptions): string {
+  const { key, publishableKey } = opts;
+  if (key != null && publishableKey != null && key !== publishableKey) {
+    throw new ConfigError("Pass the project's API key once, as `key` (`publishableKey` is its older name).");
   }
-  if (typeof opts.url !== "string" || opts.url.length === 0) {
-    throw new ConfigError("`url` is required");
-  }
-  if (!/^https?:\/\//.test(opts.url)) {
-    throw new ConfigError("`url` must start with http:// or https://");
-  }
-  // Phase 9b.H — relaxed projectId regex. Accepts the legacy slash form
-  // (`{orgSlug}/{projectName}`) AND opaque ids that provisioning emits
-  // (`proj-<10>`, `proj_<10>`). The character set is locked to
-  // `[a-zA-Z0-9_\-./]` so a malformed id with whitespace, `@`, or other
-  // URL-significant chars still fails fast. Length-capped at 128 to
-  // bound URL length when the id is interpolated into function/auth
-  // endpoint paths.
-  if (typeof opts.projectId !== "string" || !/^[a-zA-Z0-9_\-./]{1,128}$/.test(opts.projectId)) {
+  const value = key ?? publishableKey;
+  if (typeof value !== "string" || value.length === 0) {
     throw new ConfigError(
-      "`projectId` must match `[a-zA-Z0-9_\\-./]{1,128}` — slash-form `{orgSlug}/{projectName}` or opaque `proj-xxxx`",
+      "`key` is required: the project's publishable key (esk_pub_*), or a secret key (esk_sec_*) on a server only.",
     );
   }
-  if (typeof opts.publishableKey !== "string" || opts.publishableKey.length === 0) {
-    throw new ConfigError("`publishableKey` is required");
-  }
-  if (opts.publishableKey.startsWith(SECRET_KEY_PREFIX)) {
+  if (value.startsWith(SECRET_KEY_PREFIX)) {
     if (typeof window !== "undefined") {
       throw new ConfigError(
         "Secret API keys (esk_sec_*) must never be used in a browser. Use a publishable key (esk_pub_*) on the client and keep secret keys server-side only.",
       );
     }
-  } else if (!opts.publishableKey.startsWith(PUBLISHABLE_KEY_PREFIX)) {
-    // Allow custom keys for dev/test, but the common case is a typo — warn
-    // loudly via a thrown error only when the key looks clearly malformed.
-    if (opts.publishableKey.length < 16) {
-      throw new ConfigError(
-        `'publishableKey' does not look like an excalibase key (expected prefix 'esk_pub_' or 'esk_sec_'). Got '${opts.publishableKey.slice(0, 8)}...'`,
-      );
-    }
+  } else if (!value.startsWith(PUBLISHABLE_KEY_PREFIX) && value.length < 16) {
+    // Custom keys are allowed for dev/test; a short one is almost always a typo.
+    throw new ConfigError(
+      `\`key\` does not look like an excalibase key (expected prefix 'esk_pub_' or 'esk_sec_'). Got '${value.slice(0, 8)}...'`,
+    );
   }
-}
-
-function stripTrailingSlash(url: string): string {
-  return url.endsWith("/") ? url.slice(0, -1) : url;
+  return value;
 }
 
 function safeJsonParse(text: string): unknown {

@@ -4,12 +4,12 @@
  * passed as the `Database` generic to `createClient<Database>`.
  *
  * Usage:
- *   excalibase-codegen --url https://api.example.com --project acme/prod \
+ *   excalibase-codegen --url https://api.example.com --project proj-a1b2c3d4e5 \
  *     --key esk_pub_live_xxx --schemas kanban,ecommerce --out src/database.types.ts
  *
  * Args:
- *   --url       Server base URL (no trailing /graphql)
- *   --project   "{orgSlug}/{projectName}"  (optional; only used for headers)
+ *   --url       The platform's base URL (no project, no /graphql)
+ *   --project   The project id; introspection runs against {url}/{project}/graphql
  *   --key       Publishable key (esk_pub_*)
  *   --schemas   Comma-separated multi-schema prefixes (e.g. "kanban,ecommerce")
  *   --out       Output file path (default: ./src/database.types.ts)
@@ -20,6 +20,7 @@
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { generateDatabaseFile } from "../codegen";
+import { graphqlUrl, resolveProjectTarget } from "../project";
 import {
   generateApiFile,
   generateFunctionsFile,
@@ -118,14 +119,14 @@ function die(msg: string): never {
 function printHelpAndExit(code: number): never {
   process.stdout.write(
     [
-      "Usage: excalibase-codegen --url <server> --key <publishable-key> [options]",
+      "Usage: excalibase-codegen --url <platform-url> --project <project-id> --key <publishable-key> [options]",
       "",
       "Required:",
-      "  --url <url>          Server base URL (without /graphql)",
+      "  --url <url>          The platform's base URL (no project, no /graphql)",
+      "  --project <id>       The project id (the API is at <url>/<project>/graphql)",
       "  --key <key>          Publishable key (esk_pub_*)",
       "",
       "Optional:",
-      "  --project <slug>     orgSlug/projectName (sets the X-Excalibase-Project header)",
       "  --schemas <csv>      Multi-schema prefixes, comma-separated (e.g. kanban,ecommerce)",
       "  --out <path>         Output file (default: ./src/database.types.ts)",
       "  --api-out <path>     [functions only] Output path for api.ts value graph",
@@ -136,7 +137,7 @@ function printHelpAndExit(code: number): never {
       "                       per-project functions metadata endpoint.",
       "",
       "Examples:",
-      "  excalibase-codegen --url http://localhost:10004 \\",
+      "  excalibase-codegen --url https://api.example.com --project proj-a1b2c3d4e5 \\",
       "    --key esk_pub_live_abc --schemas kanban --out src/database.types.ts",
       "",
       "  excalibase-codegen functions --url http://localhost:10004 \\",
@@ -149,7 +150,10 @@ function printHelpAndExit(code: number): never {
 }
 
 export async function fetchIntrospection(args: CliArgs, fetchImpl: typeof fetch = fetch): Promise<unknown> {
-  const url = `${args.url}/graphql`;
+  if (args.project == null) {
+    throw new Error("--project is required: the API is served at <url>/<project>/graphql");
+  }
+  const url = graphqlUrl(resolveProjectTarget({ url: args.url, projectId: args.project }));
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };

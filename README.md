@@ -49,9 +49,9 @@ pagination / piping through CDNs.
 import { createClient } from "@excalibase/sdk";
 
 const db = createClient({
-  url: "http://localhost:10000",
-  projectId: "acme/prod",               // "{orgSlug}/{projectName}"
-  publishableKey: "esk_pub_live_...",   // safe to ship in browser bundles
+  url: "https://api.example.com",   // the platform's base URL
+  projectId: "proj-a1b2c3d4e5",     // the project's id
+  key: "esk_pub_live_...",          // publishable key: safe to ship in browser bundles
 });
 
 // 1. Password login (email/password user)
@@ -74,6 +74,53 @@ const { unsubscribe } = db.auth.onAuthStateChange((event, session) => {
 });
 ```
 
+## One client per project
+
+`url` is the platform's base URL, with no project and no service path. The
+client builds every path from it and the project id, the way the platform's
+edge routes them:
+
+| Surface | Path |
+|---|---|
+| GraphQL (`db.graphql`, `db.from`) | `{url}/{projectId}/graphql` |
+| Realtime (`db.graphql.subscribe`) | `ws(s)://{host}/{projectId}/graphql` |
+| REST (`db.rest`) | `{url}/{projectId}/api/v1/...` |
+| End-user auth (`db.auth`) | `{url}/auth/{orgSlug}/{projectId}/...` |
+| Functions and file uploads (`db.functions`, `db.storage`) | `{url}/functions/v1/{projectId}/{module}.{name}` |
+
+`orgSlug` is optional: auth finds the project by its id, so the org segment
+defaults to the project id. `db.graphqlEndpoint()`, `db.restEndpoint(path)`,
+`db.authEndpoint(path)`, `db.functionsEndpoint(name)` and
+`db.realtimeEndpoint()` return the URLs the client uses.
+
+Older options still work: `publishableKey` is read as `key`, and a
+`projectId` of the form `"{orgSlug}/{projectId}"` is read as the org and the
+project. A `url` that already ends in a service path (`/graphql`, `/api/v1`)
+or in the project id is refused with a `ConfigError` that says what to pass
+instead.
+
+## Realtime
+
+`db.graphql.subscribe` opens the project's WebSocket (graphql-transport-ws)
+and sends the session's token in `connection_init`; each change reaches only
+callers whose permissions cover the row. Turn realtime on for the table in
+the project first.
+
+```ts
+const sub = db.graphql.subscribe<{ publicOrdersChanges: { operation: string; data: unknown } }>(
+  "subscription { publicOrdersChanges { operation table data } }",
+  {
+    next: (data) => console.log(data.publicOrdersChanges),
+    error: (err) => console.warn("updates stopped", err),
+  },
+);
+// later
+sub.unsubscribe();
+```
+
+Browsers and Node 22+ have a global `WebSocket`. On older Node pass one:
+`createClient({ ..., WebSocket })` with `import WebSocket from "ws"`.
+
 ## Security
 
 Secret keys (`esk_sec_live_*`) are **rejected** if the SDK is initialized in
@@ -81,7 +128,7 @@ a browser context. Secret keys must only be used server-side.
 
 ```ts
 // This throws ConfigError in a browser:
-createClient({ ..., publishableKey: "esk_sec_live_..." });
+createClient({ ..., key: "esk_sec_live_..." });
 ```
 
 ## Roles
@@ -165,9 +212,9 @@ with secure storage:
 import { createClient, memoryStorageAdapter } from "@excalibase/sdk";
 
 const db = createClient({
-  url: "...",
-  projectId: "acme/prod",
-  publishableKey: "esk_pub_live_...",
+  url: "https://api.example.com",
+  projectId: "proj-a1b2c3d4e5",
+  key: "esk_pub_live_...",
   storage: memoryStorageAdapter(),  // or your own { getItem, setItem, removeItem }
 });
 ```

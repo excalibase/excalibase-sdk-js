@@ -76,15 +76,15 @@ const PUB_KEY = "esk_pub_test";
 function makeClient(fetchImpl: typeof fetch) {
   return createClient({
     url: BASE,
-    projectId: "default/p",
+    projectId: "p",
     publishableKey: PUB_KEY,
     storage: memoryStorageAdapter(),
     fetch: fetchImpl,
   });
 }
 
-const MINT = "http://localhost:10000/functions/v1/default/p/system.generateUploadUrl";
-const COMPLETE = "http://localhost:10000/functions/v1/default/p/system.completeUpload";
+const MINT = "http://localhost:10000/functions/v1/p/system.generateUploadUrl";
+const COMPLETE = "http://localhost:10000/functions/v1/p/system.completeUpload";
 const MINTED = { url: "https://r2.test/upload?sig=ABC", storageId: "kg2_minted", uploadId: "upl_1" };
 
 function header(req: CapturedRequest, name: string): string | undefined {
@@ -135,9 +135,9 @@ describe("db.storage.uploadFile", () => {
 
   test("uses opts.ref and opts.completeRef for the two mutations", async () => {
     const { fetchImpl, calls } = captureRoutes({
-      "POST http://localhost:10000/functions/v1/default/p/photos.signUpload": { body: { data: MINTED } },
+      "POST http://localhost:10000/functions/v1/p/photos.signUpload": { body: { data: MINTED } },
       [`PUT ${MINTED.url}`]: { body: "", bodyType: "raw" },
-      "POST http://localhost:10000/functions/v1/default/p/photos.attachUpload": { body: { data: null } },
+      "POST http://localhost:10000/functions/v1/p/photos.attachUpload": { body: { data: null } },
     });
     const db = makeClient(fetchImpl);
     const result = await db.storage.uploadFile(new Blob(["hello"], { type: "text/plain" }), {
@@ -145,8 +145,8 @@ describe("db.storage.uploadFile", () => {
       completeRef: { moduleName: "photos", exportName: "attachUpload" },
     });
     expect(result).toEqual({ storageId: "kg2_minted" });
-    expect(calls()[0].url).toBe("http://localhost:10000/functions/v1/default/p/photos.signUpload");
-    expect(calls()[2].url).toBe("http://localhost:10000/functions/v1/default/p/photos.attachUpload");
+    expect(calls()[0].url).toBe("http://localhost:10000/functions/v1/p/photos.signUpload");
+    expect(calls()[2].url).toBe("http://localhost:10000/functions/v1/p/photos.attachUpload");
   });
 
   test("throws when the mint mutation does not exist (404 from functions endpoint)", async () => {

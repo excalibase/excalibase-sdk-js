@@ -66,13 +66,40 @@ export interface TableMeta {
 export type SchemaMeta = Record<string, TableMeta>;
 
 export interface CreateClientOptions {
+  /**
+   * The platform's base URL, e.g. `https://api.example.com` — no project and
+   * no service path. The SDK builds `/{projectId}/graphql`,
+   * `/{projectId}/api/v1`, `/auth/{orgSlug}/{projectId}` and
+   * `/functions/v1/{projectId}` itself.
+   */
   url: string;
+  /**
+   * The project's id, e.g. `proj-a1b2c3d4e5`. The older
+   * `"{orgSlug}/{projectId}"` form is still read as the org and the project.
+   */
   projectId: string;
-  publishableKey: string;
+  /**
+   * The project's API key: a publishable key (`esk_pub_*`) in a browser, or
+   * a secret key (`esk_sec_*`) on a server only.
+   */
+  key?: string;
+  /** @deprecated Use `key`. Still accepted; it must match `key` when both are set. */
+  publishableKey?: string;
+  /**
+   * The org's slug, used as auth's org path segment. Optional: auth finds
+   * the project by its id, so it defaults to the project id.
+   */
+  orgSlug?: string;
   storage?: import("./storage").StorageAdapter;
   storageKey?: string;
   autoRefreshToken?: boolean;
   fetch?: typeof fetch;
+  /**
+   * WebSocket constructor for `db.graphql.subscribe`. Defaults to the
+   * runtime's global `WebSocket` (browsers, Node 22+); on older Node pass the
+   * `ws` package's.
+   */
+  WebSocket?: new (url: string, protocols?: string | string[]) => unknown;
   headers?: Record<string, string>;
   /**
    * Runtime table metadata emitted by `excalibase-codegen`. Optional — when

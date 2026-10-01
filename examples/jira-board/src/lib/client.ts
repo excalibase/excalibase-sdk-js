@@ -92,7 +92,7 @@ export function setIdentity(identity: DemoIdentity): DbClient {
   const db = createClient({
     url: API_URL,
     projectId: PROJECT_ID,
-    publishableKey: PUBLISHABLE_KEY,
+    key: PUBLISHABLE_KEY,
     autoRefreshToken: false,
     headers: {
       "Accept-Profile": "kanban",

@@ -59,7 +59,7 @@ describeLive("Phase E — Live codegen + typed query against kanban stack", () =
     }
     const outFile = join(tmpDir, "database.types.ts");
     execSync(
-      `node ${cliPath} --url ${GRAPHQL_URL} --token ${token} --schemas kanban --out ${outFile}`,
+      `node ${cliPath} --url ${GRAPHQL_URL} --project kanban --token ${token} --schemas kanban --out ${outFile}`,
       { stdio: "pipe" },
     );
     expect(existsSync(outFile)).toBe(true);

@@ -23,11 +23,11 @@ describe("createClient", () => {
     expect(db.url).toBe("http://localhost:10000");
   });
 
-  it("derives graphql, rest, and auth endpoints from url + projectId", () => {
+  it("derives every service endpoint from url + projectId (the {org}/{project} form names the org)", () => {
     const db = createClient(validOpts);
-    expect(db.graphqlEndpoint()).toBe("http://localhost:10000/graphql");
-    expect(db.restEndpoint("/issues")).toBe("http://localhost:10000/api/v1/issues");
-    expect(db.restEndpoint("issues")).toBe("http://localhost:10000/api/v1/issues");
+    expect(db.graphqlEndpoint()).toBe("http://localhost:10000/prod/graphql");
+    expect(db.restEndpoint("/issues")).toBe("http://localhost:10000/prod/api/v1/issues");
+    expect(db.restEndpoint("issues")).toBe("http://localhost:10000/prod/api/v1/issues");
     expect(db.authEndpoint("/token")).toBe("http://localhost:10000/auth/acme/prod/token");
     expect(db.authEndpoint("token")).toBe("http://localhost:10000/auth/acme/prod/token");
   });
@@ -40,28 +40,20 @@ describe("createClient", () => {
     expect(() => createClient({ ...validOpts, url: "ftp://nope" })).toThrow(ConfigError);
   });
 
-  it("accepts both slash-form and opaque projectIds (Phase 9b.H — relaxed regex)", () => {
-    // Slash-form (legacy public DbClient surface) — still works.
+  it("accepts opaque projectIds and the older {org}/{project} form", () => {
     expect(() => createClient({ ...validOpts, projectId: "my-org/my-proj" })).not.toThrow();
-    // Opaque-form (provisioning emits `proj_<10>` or `proj-<10>` ids without a slash).
-    // The relaxed regex must accept these so e2e + dev-CLI consumers can use
-    // createClient() with whatever id the server hands them, no parsing required.
     expect(() => createClient({ ...validOpts, projectId: "proj_xyz123abc" })).not.toThrow();
     expect(() => createClient({ ...validOpts, projectId: "proj-fuekhuce64" })).not.toThrow();
   });
 
-  it("rejects projectIds with characters outside [a-zA-Z0-9_\\-./]", () => {
+  it("rejects projectIds that are not a path segment of [a-zA-Z0-9_-]", () => {
     expect(() => createClient({ ...validOpts, projectId: "bad@id" })).toThrow(ConfigError);
     expect(() => createClient({ ...validOpts, projectId: "id with space" })).toThrow(ConfigError);
     expect(() => createClient({ ...validOpts, projectId: "" })).toThrow(ConfigError);
-    // Length cap — 128 chars max.
     expect(() => createClient({ ...validOpts, projectId: "a".repeat(129) })).toThrow(ConfigError);
   });
 
-  it("derives orgSlug/projectName safely for opaque (no-slash) projectIds", () => {
-    // When the id is opaque there's no slash to split on. Both fields fall
-    // back to the full id so downstream consumers (e.g. authEndpoint()) get
-    // a well-formed string rather than `undefined`.
+  it("uses the project id as auth's org segment when no org is given", () => {
     const db = createClient({ ...validOpts, projectId: "proj_xyz123abc" });
     expect(db.projectId).toBe("proj_xyz123abc");
     expect(db.orgSlug).toBe("proj_xyz123abc");
