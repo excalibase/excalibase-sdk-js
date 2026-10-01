@@ -1,4 +1,6 @@
 import type { DbClient } from "./client";
+import { subscribe, type SubscriptionHandlers } from "./realtime";
+import type { Subscription } from "./types";
 
 /**
  * `db.graphql` — clean namespace for executing raw GraphQL documents.
@@ -46,4 +48,40 @@ export class GraphqlNamespace {
   ): Promise<T> {
     return this.db.rawGraphql<T, V>(document, variables);
   }
+
+  /**
+   * Subscribe over the project's realtime WebSocket
+   * (`{projectId}/graphql`, graphql-transport-ws). The current session's
+   * token and the client's headers go in `connection_init`; each change
+   * reaches only callers whose permissions cover the row.
+   *
+   * @example
+   *   const sub = db.graphql.subscribe<{ publicOrdersChanges: Change }>(
+   *     "subscription { publicOrdersChanges { operation data } }",
+   *     { next: (data) => console.log(data.publicOrdersChanges), error: console.warn },
+   *   );
+   *   sub.unsubscribe();
+   */
+  subscribe<T = unknown, V extends Record<string, unknown> = Record<string, unknown>>(
+    document: string,
+    handlers: SubscriptionHandlers<T>,
+    variables?: V,
+  ): Subscription {
+    const WebSocket = this.db.webSocketConstructor();
+    return subscribe<T>(
+      {
+        url: this.db.realtimeEndpoint(),
+        query: document,
+        variables,
+        connectionPayload: () => connectionPayload(this.db.buildHeaders()),
+        WebSocket,
+      },
+      handlers,
+    );
+  }
+}
+
+function connectionPayload(headers: Record<string, string>): Record<string, unknown> {
+  const { Authorization, ...rest } = headers;
+  return Authorization === undefined ? { headers: rest } : { Authorization, headers: rest };
 }

@@ -29,11 +29,11 @@ describe("fetchIntrospection", () => {
     }) as typeof fetch;
 
     const data = await fetchIntrospection(
-      { url: "http://localhost:10004", key: "esk_pub_test", token: undefined, schemas: ["kanban"], out: "ignored.ts" },
+      { url: "http://localhost:10004", project: "proj-1", key: "esk_pub_test", token: undefined, schemas: ["kanban"], out: "ignored.ts" },
       mockFetch,
     );
     expect(captured).not.toBeNull();
-    expect(captured!.url).toBe("http://localhost:10004/graphql");
+    expect(captured!.url).toBe("http://localhost:10004/proj-1/graphql");
     expect(captured!.method).toBe("POST");
     expect(captured!.headers!["X-Excalibase-Publishable-Key"]).toBe("esk_pub_test");
     expect(captured!.body).toContain("IntrospectionQuery");
@@ -45,10 +45,16 @@ describe("fetchIntrospection", () => {
       new Response("bad", { status: 500, statusText: "Server Error" })) as typeof fetch;
     await expect(
       fetchIntrospection(
-        { url: "http://x", key: "esk_pub_test", schemas: [], out: "x.ts" },
+        { url: "http://x", project: "p", key: "esk_pub_test", schemas: [], out: "x.ts" },
         failing,
       ),
     ).rejects.toThrow(/HTTP 500/);
+  });
+
+  it("needs the project, whose path the API is served under", async () => {
+    await expect(
+      fetchIntrospection({ url: "http://x", key: "esk_pub_test", schemas: [], out: "x.ts" }, mockFetchOk()),
+    ).rejects.toThrow(/--project/);
   });
 
   it("throws when GraphQL returns errors", async () => {
@@ -56,7 +62,7 @@ describe("fetchIntrospection", () => {
       new Response(JSON.stringify({ errors: [{ message: "nope" }] }), { status: 200 })) as typeof fetch;
     await expect(
       fetchIntrospection(
-        { url: "http://x", key: "esk_pub_test", schemas: [], out: "x.ts" },
+        { url: "http://x", project: "p", key: "esk_pub_test", schemas: [], out: "x.ts" },
         erroring,
       ),
     ).rejects.toThrow(/errors/);
@@ -78,7 +84,7 @@ describe("runCodegen", () => {
     process.chdir(tmpDir);
     try {
       await runCodegen(
-        { url: "http://x", key: "esk_pub_test", schemas: ["kanban"], out: outPath },
+        { url: "http://x", project: "p", key: "esk_pub_test", schemas: ["kanban"], out: outPath },
         mockFetchOk(),
       );
     } finally {

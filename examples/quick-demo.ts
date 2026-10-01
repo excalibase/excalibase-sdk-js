@@ -46,7 +46,7 @@ async function main() {
   // ── Step 2: Codegen ──────────────────────────────────────────────
   console.log("2. Running codegen against live server...");
   const introspection = await fetchIntrospection(
-    { url: GRAPHQL_URL, token, schemas: ["kanban"], out: "" },
+    { url: GRAPHQL_URL, project: PROJECT.projectName, token, schemas: ["kanban"], out: "" },
   );
   const parsed = parseIntrospection(introspection, { schemas: ["kanban"] });
   console.log(`   ✓ found ${parsed.tables.length} tables, ${parsed.enums.length} enums`);
@@ -68,8 +68,9 @@ async function main() {
   console.log("3. Creating typed client with generated schema...");
   const db = createClient({
     url: GRAPHQL_URL,
-    projectId: `${PROJECT.orgSlug}/${PROJECT.projectName}`,
-    publishableKey: "esk_pub_unused",
+    projectId: PROJECT.projectName,
+    orgSlug: PROJECT.orgSlug,
+    key: "esk_pub_unused_demo_key",
     schema,
     headers: { Authorization: `Bearer ${token}` },
   });

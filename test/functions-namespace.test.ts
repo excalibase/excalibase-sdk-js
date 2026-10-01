@@ -259,7 +259,7 @@ describe("FunctionsNamespace (low-level)", () => {
 describe("createClient → db.functions wiring", () => {
   const validOpts = {
     url: "http://localhost:10000",
-    projectId: "acme/prod",
+    projectId: "proj-1",
     publishableKey: "esk_pub_live_abcdefghijklmnop",
     storage: memoryStorageAdapter(),
     autoRefreshToken: false,
@@ -292,7 +292,7 @@ describe("createClient → db.functions wiring", () => {
     const fns = db.functions as unknown as any;
     const out = await fns.users.list({ status: "active" });
     expect(out).toEqual({ total: 7 });
-    expect(captured!.url).toBe("http://localhost:10000/functions/v1/acme/prod/users.list");
+    expect(captured!.url).toBe("http://localhost:10000/functions/v1/proj-1/users.list");
     expect(captured!.headers["X-Excalibase-Publishable-Key"]).toBe(validOpts.publishableKey);
     expect(captured!.body).toEqual({ args: { status: "active" } });
   });
