@@ -42,8 +42,14 @@ const customer = [
   },
   { table: 'public.order_items', role: 'user', operation: 'select', rule: { filter: own, columns: '*' } },
   {
+    // A line goes only on the customer's own order while it is still open; in a
+    // nested insert the check sees the order inserted just before it.
     table: 'public.order_items', role: 'user', operation: 'insert',
-    rule: { check: own, columns: ['order_id', 'product_id', 'quantity'], set: { customer_id: ME } },
+    rule: {
+      check: { _and: [own, { publicOrderId: { customer_id: { _eq: ME }, status: { _eq: 'placed' } } }] },
+      columns: ['order_id', 'product_id', 'quantity'],
+      set: { customer_id: ME },
+    },
   },
 ];
 

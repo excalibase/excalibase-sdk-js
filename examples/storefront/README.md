@@ -19,8 +19,10 @@ What it uses:
 - **A custom role** given to an account through the project's end-user role
   API (`staff`, allowed to act as `user` too).
 - **A nested insert**: an order and its line items in one `createPublicOrders`
-  mutation. Database triggers price each line, take stock (an order that would
-  oversell fails as a whole) and total the order.
+  mutation. The line items' insert permission admits a line only on the
+  customer's own open order (the check sees the order inserted just before it);
+  database triggers price each line, take stock (an order that would oversell
+  fails as a whole) and total the order.
 - **A tracked function**: `best_sellers(top)` ranks products by units sold. It
   is `STABLE`, so it is a query every role that reads products may call, and
   its rows pass through the caller's own products permission (guests never see

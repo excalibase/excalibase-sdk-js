@@ -52,16 +52,14 @@ CREATE INDEX order_items_order_id ON order_items(order_id);
 CREATE INDEX orders_customer_id ON orders(customer_id);
 
 -- Prices and stock are the database's business, not the browser's: a line
--- item goes only into an open order of the same customer, takes the product's
--- current price, and an order that would oversell fails as a whole.
+-- item takes the product's current price, and an order that would oversell
+-- fails as a whole. (Which orders a customer may add lines to is the
+-- order_items insert permission, setup/permissions.mjs.)
 CREATE FUNCTION order_items_price_and_stock() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
   left_in_stock integer;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM orders WHERE id = NEW.order_id AND customer_id = NEW.customer_id AND status = 'placed') THEN
-    RAISE EXCEPTION 'order % is not an open order of this customer', NEW.order_id;
-  END IF;
   SELECT price, stock INTO NEW.unit_price, left_in_stock FROM products WHERE id = NEW.product_id AND active FOR UPDATE;
   IF NEW.unit_price IS NULL THEN
     RAISE EXCEPTION 'product % is not for sale', NEW.product_id;
