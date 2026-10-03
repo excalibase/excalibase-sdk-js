@@ -7,7 +7,7 @@ const ME = 'X-Excalibase-User-Id';
 const own = { customer_id: { _eq: ME } };
 const everything = {};
 
-const PRODUCT_COLUMNS = ['id', 'category_id', 'name', 'description', 'price', 'stock', 'image_url', 'active'];
+const PRODUCT_COLUMNS = ['id', 'category_id', 'name', 'description', 'price', 'stock', 'image_id', 'active'];
 
 const catalog = (role) => [
   { table: 'public.categories', role, operation: 'select', rule: { filter: everything, columns: '*' } },
@@ -65,7 +65,7 @@ const staff = [
   },
   {
     table: 'public.products', role: 'staff', operation: 'update',
-    rule: { filter: everything, check: everything, columns: ['name', 'description', 'price', 'stock', 'active'] },
+    rule: { filter: everything, check: everything, columns: ['name', 'description', 'price', 'stock', 'image_id', 'active'] },
   },
   {
     table: 'public.orders', role: 'staff', operation: 'select',

@@ -5,9 +5,9 @@ import type { DbClient } from "@excalibase/sdk";
 import { decimal, int, str } from "./gql";
 import type { CartItem, Category, Order, OrderStatus, Product } from "./types";
 
-const PRODUCT_FIELDS = "id category_id name description price stock image_url active";
+const PRODUCT_FIELDS = "id category_id name description price stock image_id active";
 const ORDER_FIELDS = `id status total note created_at
-  publicOrderItems(orderBy: { id: ASC }) { id quantity unit_price publicProductId { id name image_url } }`;
+  publicOrderItems(orderBy: { id: ASC }) { id quantity unit_price publicProductId { id name image_id } }`;
 
 export async function catalog(db: DbClient): Promise<{ categories: Category[]; products: Product[] }> {
   const data = await db.graphql.query<{ publicCategories: Category[]; publicProducts: Product[] }>(`{
@@ -121,14 +121,21 @@ export interface NewProduct {
   description: string;
   price: number;
   stock: number;
-  imageUrl: string;
 }
 
 export async function createProduct(db: DbClient, product: NewProduct): Promise<void> {
   await db.graphql.mutation(`mutation { createPublicProducts(input: {
     category_id: ${int(product.categoryId)}, name: ${str(product.name)}, description: ${str(product.description)},
-    price: ${decimal(product.price)}, stock: ${int(product.stock)}, image_url: ${str(product.imageUrl)}, active: true
+    price: ${decimal(product.price)}, stock: ${int(product.stock)}, active: true
   }) { id } }`);
+}
+
+// A picture staff uploaded (db.storage.uploadFile) becomes the product's: the
+// products update permission lets staff, and only staff, set image_id.
+export async function setProductImage(db: DbClient, productId: number, storageId: string): Promise<void> {
+  await db.graphql.mutation(
+    `mutation { updatePublicProducts(where: { id: { eq: ${int(productId)} } }, input: { image_id: ${str(storageId)} }) { id } }`,
+  );
 }
 
 // The engine's own message, without graphql-request's echo of the request.

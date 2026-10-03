@@ -8,7 +8,7 @@ videos.
 |---|---|
 | Guest (`anon`, no token) | browses the catalog and the best sellers; no cart, no orders: those tables do not exist for `anon` |
 | Customer (`user`, a signed-in account) | a cart and orders that are only their own; places an order with its line items in one mutation; sees its status change live |
-| Staff (the custom role `staff`) | every order, with the customer's email; changes order status; edits prices, stock and what is on sale; adds products |
+| Staff (the custom role `staff`) | every order, with the customer's email; changes order status; edits prices, stock and what is on sale; adds products; uploads product pictures |
 
 What it uses:
 
@@ -32,6 +32,16 @@ What it uses:
   arrive. Each change reaches only callers whose permission covers the row.
 - **End-user auth** through `@excalibase/sdk` (sign up, sign in, session kept
   and refreshed).
+- **Storage**: product pictures are uploaded by staff with
+  `db.storage.uploadFile(file)` and live in the project's Storage, not in the
+  store's image. The store deploys three functions (`functions/`): the two
+  mutations `uploadFile` calls by default, `system.generateUploadUrl` and
+  `system.completeUpload`, which refuse anyone whose verified token is not
+  `staff` and anything but a png, jpeg, webp or gif up to 5 MB; and the query
+  `images.urls`, which turns storage ids into short-lived links for every
+  caller. A product names its picture by storage id (`image_id`, which only
+  staff may set), so a picture is seen by whoever may read its product, and
+  an id from another project resolves to nothing.
 - **Containers**: the store's own server runs as an app next to the project,
   and counts product views ("Trending now") in a Redis that only the project's
   apps can reach, over the project's private network.
@@ -65,11 +75,18 @@ What it uses:
    Everything goes through the platform's APIs: the schema and sample products
    (`/api/schema/{id}/ddl`), the permissions and the tracked function
    (`/api/provision/{id}/permissions`, `/tracked-functions`), realtime on
-   `orders`, a publishable key, CORS for the store's URL, three demo accounts
+   `orders`, the store's functions (`/api/projects/{id}/functions`), a
+   publishable key, CORS for the store's URL, three demo accounts
    (`alice@` and `bob@` customers, `sam@` staff, under `example.test` unless
    `DEMO_EMAIL_DOMAIN` says otherwise; one password, from `DEMO_PASSWORD` or
-   generated and printed), and the store's `EXCALIBASE_*` variables, after which
-   the store is redeployed. Running it again is safe: what exists is kept.
+   generated and printed), the sample pictures (`setup/images`) uploaded to
+   Storage as `sam@` through the store's upload functions, and the store's
+   `EXCALIBASE_*` variables (including `EXCALIBASE_STORAGE_ORIGIN`, where
+   pictures are served from, for its Content-Security-Policy), after which the
+   store is redeployed. Running it again is safe with the same `DEMO_PASSWORD`:
+   what exists is kept. `EXCALIBASE_DATA_API_URL` names where the script
+   itself reaches the project's GraphQL and functions when that differs from
+   the data URL the browser uses.
    The script also ships in the store's image, so no checkout is needed:
    `docker run --rm -e EXCALIBASE_API=… -e EXCALIBASE_TOKEN=… -e EXCALIBASE_DATA_URL=… -e PROJECT_ID=… <the template's image> node setup/setup.mjs`.
 4. Open the store's URL (printed at the end, and shown on the app in Studio).
@@ -97,14 +114,16 @@ VITE_EXCALIBASE_ORG_SLUG=<org slug> VITE_EXCALIBASE_PUBLISHABLE_KEY=<publishable
 | `src/lib/platform-fetch.ts` | the SDK takes one base URL; this moves GraphQL, REST and functions calls to the project's paths on the data plane (`/{projectId}/graphql`), while auth stays at `/auth/{org}/{project}` |
 | `src/lib/store.ts` | every query and mutation the store makes |
 | `src/lib/realtime.ts` | the order subscription (`graphql-ws`; the token goes in `connection_init`) |
+| `src/lib/images.ts` | picture links: every picture a render needs is asked for in one `images.urls` call, renewed before the links expire |
+| `functions/` | the store's functions and its storage rules (`storage-rules.ts`) |
 | `server/` | the container's server: the SPA, `/config.js` (the project, from the app's variables), `/api/views` and `/api/trending` (Redis) |
 | `setup/` | the setup script, the schema and the permissions |
 | `Dockerfile` | the image the template runs: Node 22 on Alpine, pinned by digest, non-root, port 8080 |
 
 `npm test` runs the unit tests (server, setup helpers, SPA helpers).
 
-## Not shown here
+## Storage on your own install
 
-- Product pictures are part of the app, not uploads: uploading through
-  `db.storage.uploadFile` needs the project's functions runtime to reach
-  Storage, which it does not on the platform yet.
+The browser uploads straight to the object store with the signed URL the
+platform mints, so the bucket must allow `PUT` from the store's origin (CORS
+on the R2 bucket; MinIO allows it by default).
