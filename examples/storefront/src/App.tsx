@@ -19,7 +19,7 @@ export type View =
   | { kind: "staff" };
 
 export default function App() {
-  const { role, session, config } = useSession();
+  const { db, role, session } = useSession();
   const queryClient = useQueryClient();
   const toasts = useToasts();
   const [view, setView] = useState<View>({ kind: "catalog", categoryId: null });
@@ -40,7 +40,7 @@ export default function App() {
   // so the engine would refuse the subscription).
   useEffect(() => {
     if (!token) return undefined;
-    return watchOrders(config, token, (change) => {
+    return watchOrders(db, (change) => {
       void queryClient.invalidateQueries({ queryKey: ["orders"] });
       if (change.operation === "UPDATE" && change.row.status) {
         toasts.push(`Order #${change.row.id} is now ${change.row.status}`);
@@ -49,7 +49,7 @@ export default function App() {
       }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, config]);
+  }, [token, db]);
 
   return (
     <div className="min-h-screen flex flex-col">

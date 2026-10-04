@@ -1,9 +1,8 @@
-// Order changes as they happen, over the project's GraphQL websocket
-// (graphql-transport-ws). The token goes in connection_init, since a browser
-// cannot set headers on a websocket; the engine sends a change only to callers
-// whose select permission covers the row, with only their columns.
-import { createClient, type Client } from "graphql-ws";
-import type { StoreConfig } from "./config";
+// Order changes as they happen, over the project's realtime WebSocket through
+// the SDK (which sends the session's token in connection_init). The engine
+// sends a change only to callers whose select permission covers the row, with
+// only their columns.
+import type { DbClient } from "@excalibase/sdk";
 import type { OrderStatus } from "./types";
 
 interface OrderRow {
@@ -29,34 +28,17 @@ export function toOrderChange(raw: RawChange): OrderChange | null {
   return row ? { operation: raw.operation, row } : null;
 }
 
-export function socketUrl(config: StoreConfig): string {
-  return `${config.url.replace(/^http/, "ws")}/${config.projectId}/graphql`;
-}
-
-export function watchOrders(
-  config: StoreConfig,
-  accessToken: string | null,
-  onChange: (change: OrderChange) => void,
-): () => void {
-  const client: Client = createClient({
-    url: socketUrl(config),
-    connectionParams: () => (accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-    retryAttempts: 5,
-  });
-  const stop = client.subscribe<{ publicOrdersChanges: RawChange }>(
-    { query: "subscription { publicOrdersChanges { operation table data } }" },
+export function watchOrders(db: DbClient, onChange: (change: OrderChange) => void): () => void {
+  const subscription = db.graphql.subscribe<{ publicOrdersChanges: RawChange }>(
+    "subscription { publicOrdersChanges { operation table data } }",
     {
-      next: (message) => {
-        const raw = message.data?.publicOrdersChanges;
+      next: (data) => {
+        const raw = data?.publicOrdersChanges;
         const change = raw ? toOrderChange(raw) : null;
         if (change) onChange(change);
       },
       error: (err) => console.warn("order updates stopped", err),
-      complete: () => undefined,
     },
   );
-  return () => {
-    stop();
-    void client.dispose();
-  };
+  return () => subscription.unsubscribe();
 }
