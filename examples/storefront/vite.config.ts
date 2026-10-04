@@ -8,5 +8,5 @@ export default defineConfig({
   plugins: [react()],
   server: { port: 5176, host: true },
   preview: { port: 5176 },
-  test: { include: ["src/**/*.test.ts"], environment: "node" },
+  test: { include: ["src/**/*.test.ts", "functions/**/*.test.ts"], environment: "node" },
 });

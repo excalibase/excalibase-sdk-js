@@ -42,3 +42,16 @@ test('a plain-http data plane gets ws, and no data plane leaves connect-src to s
   assert.match(contentSecurityPolicy({ ...ENV, EXCALIBASE_URL: 'http://api.local:8080' }), /connect-src 'self' http:\/\/api\.local:8080 ws:\/\/api\.local:8080;/);
   assert.match(contentSecurityPolicy({}), /connect-src 'self';/);
 });
+
+test('pictures and uploads may use the project storage origin, and nothing else', () => {
+  const policy = contentSecurityPolicy({ ...ENV, EXCALIBASE_STORAGE_ORIGIN: 'https://files.example.test' });
+  assert.match(policy, /img-src 'self' data: https:\/\/files\.example\.test;/);
+  assert.match(policy, /connect-src 'self' https:\/\/api\.example\.test wss:\/\/api\.example\.test https:\/\/files\.example\.test;/);
+  assert.match(contentSecurityPolicy(ENV), /img-src 'self' data:;/);
+});
+
+test('a storage origin that is not an http(s) origin is left out', () => {
+  for (const value of ['javascript:alert(1)', 'https://files.example.test/path', "https://x.test; script-src *", 'not a url']) {
+    assert.match(contentSecurityPolicy({ ...ENV, EXCALIBASE_STORAGE_ORIGIN: value }), /img-src 'self' data:;/, value);
+  }
+});

@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { DbClient, Session } from "@excalibase/sdk";
 import type { StoreConfig } from "../lib/config";
+import { createImageUrlLoader, imageUrlsFrom } from "../lib/images";
 import { claimsOf, roleOf } from "../lib/token";
 
 interface SessionState {
@@ -13,6 +14,7 @@ interface SessionState {
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (email: string, password: string, fullName: string) => Promise<void>;
   signOut: () => Promise<void>;
+  imageUrl: (storageId: string) => Promise<string | null>;
 }
 
 const SessionContext = createContext<SessionState | null>(null);
@@ -20,6 +22,7 @@ const SessionContext = createContext<SessionState | null>(null);
 export function SessionProvider({ db, config, children }: { db: DbClient; config: StoreConfig; children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [ready, setReady] = useState(false);
+  const imageUrl = useMemo(() => createImageUrlLoader(imageUrlsFrom(db)), [db]);
 
   useEffect(() => {
     let live = true;
@@ -54,8 +57,9 @@ export function SessionProvider({ db, config, children }: { db: DbClient; config
       signOut: async () => {
         await db.auth.signOut();
       },
+      imageUrl,
     };
-  }, [db, config, ready, session]);
+  }, [db, config, ready, session, imageUrl]);
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
 }

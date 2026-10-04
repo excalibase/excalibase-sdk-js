@@ -21,6 +21,20 @@ export function configScript(env) {
   return `window.__STOREFRONT__ = ${json};\n`;
 }
 
+// Where product pictures are served from and uploaded to (the project's
+// object store), when it is a bare http(s) origin; anything else is ignored.
+function storageOrigin(env) {
+  const value = env.EXCALIBASE_STORAGE_ORIGIN;
+  if (!value) return '';
+  try {
+    const url = new URL(value);
+    if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.origin !== value.replace(/\/$/, '')) return '';
+    return ` ${url.origin}`;
+  } catch {
+    return '';
+  }
+}
+
 export function contentSecurityPolicy(env) {
   let dataPlane = '';
   if (env.EXCALIBASE_URL) {
@@ -28,10 +42,11 @@ export function contentSecurityPolicy(env) {
     const socket = url.protocol === 'https:' ? 'wss:' : 'ws:';
     dataPlane = ` ${url.protocol}//${url.host} ${socket}//${url.host}`;
   }
+  const storage = storageOrigin(env);
   return [
     "default-src 'self'",
-    `connect-src 'self'${dataPlane}`,
-    "img-src 'self' data:",
+    `connect-src 'self'${dataPlane}${storage}`,
+    `img-src 'self' data:${storage}`,
     "style-src 'self' 'unsafe-inline'",
     "frame-ancestors 'none'",
     "base-uri 'none'",

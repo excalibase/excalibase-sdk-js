@@ -1,9 +1,10 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type ChangeEvent, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSession } from "../hooks/session";
 import { money } from "../lib/money";
-import { allOrders, catalog, createProduct, messageOf, setOrderStatus, updateProduct, type ProductChange } from "../lib/store";
+import { allOrders, catalog, createProduct, messageOf, setOrderStatus, setProductImage, updateProduct, type ProductChange } from "../lib/store";
 import { ORDER_STATUSES, type OrderStatus, type Product } from "../lib/types";
+import { ProductArt } from "./ProductCard";
 import { StatusPill } from "./StatusPill";
 
 export function StaffPage() {
@@ -74,6 +75,16 @@ function Inventory() {
     onSuccess: refresh,
     onError: (err) => setError(messageOf(err)),
   });
+  // The picture goes to the project's Storage through db.storage.uploadFile
+  // (the store's upload functions let staff only), then onto the product.
+  const upload = useMutation({
+    mutationFn: async ({ id, file }: { id: number; file: File }) => {
+      const { storageId } = await db.storage.uploadFile(file);
+      await setProductImage(db, id, storageId);
+    },
+    onSuccess: refresh,
+    onError: (err) => setError(messageOf(err)),
+  });
 
   return (
     <div className="mt-6 flex flex-col gap-6">
@@ -81,11 +92,12 @@ function Inventory() {
       <div className="card overflow-hidden">
         <table className="w-full text-sm" data-testid="inventory">
           <thead className="bg-stone-50 text-stone-500 text-left">
-            <tr><th className="p-3">Product</th><th className="p-3">Price</th><th className="p-3">Stock</th><th className="p-3">On sale</th></tr>
+            <tr><th className="p-3">Picture</th><th className="p-3">Product</th><th className="p-3">Price</th><th className="p-3">Stock</th><th className="p-3">On sale</th></tr>
           </thead>
           <tbody>
             {shop.data?.products.map((product) => (
-              <InventoryRow key={product.id} product={product} onSave={(change) => save.mutate({ id: product.id, change })} />
+              <InventoryRow key={product.id} product={product} onSave={(change) => save.mutate({ id: product.id, change })}
+                onPicture={(file) => upload.mutate({ id: product.id, file })} uploading={upload.isPending && upload.variables?.id === product.id} />
             ))}
           </tbody>
         </table>
@@ -95,7 +107,12 @@ function Inventory() {
   );
 }
 
-function InventoryRow({ product, onSave }: { product: Product; onSave: (change: ProductChange) => void }) {
+function InventoryRow({ product, onSave, onPicture, uploading }: {
+  product: Product;
+  onSave: (change: ProductChange) => void;
+  onPicture: (file: File) => void;
+  uploading: boolean;
+}) {
   const [price, setPrice] = useState(String(product.price));
   const [stock, setStock] = useState(String(product.stock));
   // Shown at once; the refetch after the save confirms it.
@@ -109,6 +126,17 @@ function InventoryRow({ product, onSave }: { product: Product; onSave: (change: 
   };
   return (
     <tr className="border-t border-stone-100" data-testid={`inventory-${product.id}`}>
+      <td className="p-3">
+        <label className="block w-16 h-12 cursor-pointer" title="Upload a picture" data-testid="picture">
+          <ProductArt product={product} className={`w-16 h-12 rounded-md ${uploading ? "opacity-50" : ""}`} />
+          <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" className="sr-only" data-testid="picture-input"
+            onChange={(e: ChangeEvent<HTMLInputElement>) => {
+              const file = e.target.files?.[0];
+              if (file) onPicture(file);
+              e.target.value = "";
+            }} />
+        </label>
+      </td>
       <td className="p-3 font-medium">{product.name}</td>
       <td className="p-3"><input className="input w-24" value={price} onChange={(e) => setPrice(e.target.value)} onBlur={commit} data-testid="price" /></td>
       <td className="p-3"><input className="input w-20" value={stock} onChange={(e) => setStock(e.target.value)} onBlur={commit} data-testid="stock" /></td>
@@ -120,8 +148,6 @@ function InventoryRow({ product, onSave }: { product: Product; onSave: (change: 
   );
 }
 
-const ART = ["lamp", "mat", "pen", "kettle", "mug", "beans", "tote", "sleeve", "stand"];
-
 function NewProductForm({ categories, onCreated, onError }: {
   categories: { id: number; name: string }[];
   onCreated: () => void;
@@ -132,7 +158,6 @@ function NewProductForm({ categories, onCreated, onError }: {
   const [price, setPrice] = useState("");
   const [stock, setStock] = useState("10");
   const [categoryId, setCategoryId] = useState<number | null>(null);
-  const [art, setArt] = useState(ART[0]);
   const create = useMutation({
     mutationFn: () => createProduct(db, {
       categoryId: categoryId ?? categories[0]?.id ?? 1,
@@ -140,7 +165,6 @@ function NewProductForm({ categories, onCreated, onError }: {
       description: "New in the shop.",
       price: Number(price),
       stock: Number(stock),
-      imageUrl: `/products/${art}.svg`,
     }),
     onSuccess: () => {
       setName("");
@@ -162,9 +186,6 @@ function NewProductForm({ categories, onCreated, onError }: {
       <input className="input w-20" placeholder="Stock" value={stock} onChange={(e) => setStock(e.target.value)} required inputMode="numeric" />
       <select className="input w-36" value={categoryId ?? ""} onChange={(e) => setCategoryId(Number(e.target.value))}>
         {categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
-      </select>
-      <select className="input w-32" value={art} onChange={(e) => setArt(e.target.value)} aria-label="Picture">
-        {ART.map((name) => <option key={name} value={name}>{name}</option>)}
       </select>
       <button className="btn btn-primary" disabled={create.isPending} data-testid="new-submit">Add</button>
     </form>

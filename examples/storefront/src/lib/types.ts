@@ -11,7 +11,8 @@ export interface Product {
   description: string;
   price: string | number;
   stock: number;
-  image_url: string | null;
+  // A storage id in the project's Storage; images.urls turns it into a link.
+  image_id: string | null;
   active: boolean;
 }
 
@@ -29,7 +30,7 @@ export interface OrderItem {
   id: number;
   quantity: number;
   unit_price: string | number;
-  publicProductId: Pick<Product, "id" | "name" | "image_url"> | null;
+  publicProductId: Pick<Product, "id" | "name" | "image_id"> | null;
 }
 
 export interface Order {
