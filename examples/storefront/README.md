@@ -37,7 +37,8 @@ What it uses:
   store's image. The store deploys three functions (`functions/`): the two
   mutations `uploadFile` calls by default, `system.generateUploadUrl` and
   `system.completeUpload`, which refuse anyone whose verified token is not
-  `staff` and anything but a png, jpeg, webp or gif up to 5 MB; and the query
+  `staff` (`403`; no token is `401`) and anything but a png, jpeg, webp or gif
+  up to 5 MB (`400`), by throwing `FunctionError`; and the query
   `images.urls`, which turns storage ids into short-lived links for every
   caller. A product names its picture by storage id (`image_id`, which only
   staff may set), so a picture is seen by whoever may read its product, and

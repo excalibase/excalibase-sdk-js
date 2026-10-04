@@ -21,3 +21,15 @@ test('every function carries its entry as index.ts and the shared storage rules'
     assert.doesNotMatch(entry, /^import .* from "\.\.\//m, deploy.id);
   }
 });
+
+test('every function refuses a caller with FunctionError, so the caller gets 4xx and not 500', async () => {
+  for (const deploy of await functionDeploys()) {
+    const entry = deploy.files.find((f) => f.path === 'index.ts').content;
+    assert.match(entry, /import \{[^}]*\bFunctionError\b[^}]*\} from "npm:@excalibase\/server@0\.13\.0"/, deploy.id);
+    assert.match(entry, /throw new FunctionError\(refusal\.status, refusal\.message\)/, deploy.id);
+    assert.doesNotMatch(entry, /throw new Error\(/, deploy.id);
+  }
+  const [first] = await functionDeploys();
+  const rules = first.files.find((f) => f.path === 'storage-rules.ts').content;
+  assert.doesNotMatch(rules, /throw /, 'storage rules return refusals; the functions throw them');
+});
