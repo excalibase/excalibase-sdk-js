@@ -29,13 +29,19 @@ export {
   defaultStorage,
   type StorageAdapter,
 } from "./storage";
-export { FileStorageClient } from "./storage/client";
+export { FileStorageClient, StorageError } from "./storage/client";
 export type { SubscriptionHandlers, WebSocketLike, WebSocketConstructor } from "./realtime";
 export type {
   FileStorageClientOptions,
   UploadMutationRef,
   UploadFileOptions,
-  UploadFileResult,
+  StoredFile,
+  DownloadUrl,
+  ListOptions,
+  ListedFile,
+  ListPage,
+  UploadViaFunctionsOptions,
+  UploadViaFunctionsResult,
 } from "./storage/client";
 export { ExcalibaseError, AuthError, NetworkError, ConfigError } from "./errors";
 export type {

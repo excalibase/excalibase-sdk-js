@@ -1,5 +1,5 @@
 /**
- * `db.storage.uploadFile(blob)` speaks the staged upload protocol:
+ * `db.storage.uploadViaFunctions(blob)` speaks the staged upload protocol:
  *   1. a mutation mints the URL for a declared `{ contentType, size }` and
  *      returns `{ url, storageId, uploadId }`;
  *   2. the blob is PUT with exactly that Content-Type and Content-Length
@@ -100,13 +100,13 @@ function happyRoutes(overrides: Record<string, { status?: number; body: unknown;
   });
 }
 
-describe("db.storage.uploadFile", () => {
+describe("db.storage.uploadViaFunctions", () => {
   test("declares the type and size, PUTs with both headers, completes, returns storageId", async () => {
     const { fetchImpl, calls } = happyRoutes();
     const db = makeClient(fetchImpl);
     const blob = new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" });
 
-    const result = await db.storage.uploadFile(blob);
+    const result = await db.storage.uploadViaFunctions(blob);
 
     expect(result).toEqual({ storageId: "kg2_minted" });
     const [mint, put, complete] = calls();
@@ -126,7 +126,7 @@ describe("db.storage.uploadFile", () => {
   test("declares application/octet-stream for an untyped blob and PUTs with the same type", async () => {
     const { fetchImpl, calls } = happyRoutes();
     const db = makeClient(fetchImpl);
-    await db.storage.uploadFile(new Blob([new Uint8Array(8)]));
+    await db.storage.uploadViaFunctions(new Blob([new Uint8Array(8)]));
     const [mint, put] = calls();
     expect(mint.body).toEqual({ args: { contentType: "application/octet-stream", size: 8 } });
     expect(header(put, "Content-Type")).toBe("application/octet-stream");
@@ -140,7 +140,7 @@ describe("db.storage.uploadFile", () => {
       "POST http://localhost:10000/functions/v1/p/photos.attachUpload": { body: { data: null } },
     });
     const db = makeClient(fetchImpl);
-    const result = await db.storage.uploadFile(new Blob(["hello"], { type: "text/plain" }), {
+    const result = await db.storage.uploadViaFunctions(new Blob(["hello"], { type: "text/plain" }), {
       ref: { moduleName: "photos", exportName: "signUpload" },
       completeRef: { moduleName: "photos", exportName: "attachUpload" },
     });
@@ -154,13 +154,13 @@ describe("db.storage.uploadFile", () => {
       [`POST ${MINT}`]: { status: 404, body: { error: "function not found" } },
     });
     const db = makeClient(fetchImpl);
-    await expect(db.storage.uploadFile(new Blob(["x"], { type: "text/plain" }))).rejects.toThrow(/HTTP 404/);
+    await expect(db.storage.uploadViaFunctions(new Blob(["x"], { type: "text/plain" }))).rejects.toThrow(/HTTP 404/);
   });
 
   test("throws FunctionsError when the mint mutation returns an error envelope", async () => {
     const { fetchImpl } = captureRoutes({ [`POST ${MINT}`]: { body: { error: "quota exceeded" } } });
     const db = makeClient(fetchImpl);
-    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(/quota exceeded/);
+    await expect(db.storage.uploadViaFunctions(new Blob(["x"]))).rejects.toThrow(/quota exceeded/);
   });
 
   test.each([
@@ -170,7 +170,7 @@ describe("db.storage.uploadFile", () => {
   ])("throws before uploading when the mint result has no %s", async (missing, data) => {
     const { fetchImpl, calls } = captureRoutes({ [`POST ${MINT}`]: { body: { data } } });
     const db = makeClient(fetchImpl);
-    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(new RegExp(missing));
+    await expect(db.storage.uploadViaFunctions(new Blob(["x"]))).rejects.toThrow(new RegExp(missing));
     expect(calls().length).toBe(1);
   });
 
@@ -179,8 +179,8 @@ describe("db.storage.uploadFile", () => {
       [`PUT ${MINTED.url}`]: { status: 403, body: "SignatureDoesNotMatch", bodyType: "raw" },
     });
     const db = makeClient(fetchImpl);
-    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(
-      /upload refused \(HTTP 403\).*size and type/,
+    await expect(db.storage.uploadViaFunctions(new Blob(["x"]))).rejects.toThrow(
+      /refused the upload \(HTTP 403\).*size and type/,
     );
     expect(calls().length).toBe(2);
   });
@@ -190,7 +190,7 @@ describe("db.storage.uploadFile", () => {
       [`PUT ${MINTED.url}`]: { status: 500, body: "internal error", bodyType: "raw" },
     });
     const db = makeClient(fetchImpl);
-    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(/upload failed \(HTTP 500\)/);
+    await expect(db.storage.uploadViaFunctions(new Blob(["x"]))).rejects.toThrow(/refused the upload \(HTTP 500\)/);
   });
 
   test("does not return a storageId when completing the upload is refused", async () => {
@@ -198,7 +198,7 @@ describe("db.storage.uploadFile", () => {
       [`POST ${COMPLETE}`]: { status: 413, body: { error: "project storage quota exceeded" } },
     });
     const db = makeClient(fetchImpl);
-    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(/system\.completeUpload returned HTTP 413/);
+    await expect(db.storage.uploadViaFunctions(new Blob(["x"]))).rejects.toThrow(/system\.completeUpload returned HTTP 413/);
   });
 
   test("does not return a storageId when the completion mutation returns an error envelope", async () => {
@@ -206,7 +206,7 @@ describe("db.storage.uploadFile", () => {
       [`POST ${COMPLETE}`]: { body: { error: "content type not allowed" } },
     });
     const db = makeClient(fetchImpl);
-    await expect(db.storage.uploadFile(new Blob(["x"]))).rejects.toThrow(/content type not allowed/);
+    await expect(db.storage.uploadViaFunctions(new Blob(["x"]))).rejects.toThrow(/content type not allowed/);
   });
 
   test("ignores a storageId in the PUT response: only the minted one is used", async () => {
@@ -214,7 +214,7 @@ describe("db.storage.uploadFile", () => {
       [`PUT ${MINTED.url}`]: { body: { storageId: "kg2_fromPut" } },
     });
     const db = makeClient(fetchImpl);
-    const { storageId } = await db.storage.uploadFile(new Blob(["x"]));
+    const { storageId } = await db.storage.uploadViaFunctions(new Blob(["x"]));
     expect(storageId).toBe("kg2_minted");
   });
 
@@ -223,7 +223,7 @@ describe("db.storage.uploadFile", () => {
     const db = makeClient(fetchImpl);
     await expect(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (db.storage as any).uploadFile(undefined),
+      (db.storage as any).uploadViaFunctions(undefined),
     ).rejects.toThrow(/blob/i);
   });
 });

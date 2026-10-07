@@ -108,7 +108,7 @@ describeLive("live: createClient({ url, projectId, key }) on the platform edge",
 
   itStorage("uploads a file through /functions/v1/{projectId}", async () => {
     const blob = new Blob([`hello from ${marker}`], { type: "text/plain" });
-    const { storageId } = await db.storage.uploadFile(blob, {
+    const { storageId } = await db.storage.uploadViaFunctions(blob, {
       ref: { moduleName: "uploads", exportName: "mint" },
       completeRef: { moduleName: "uploads", exportName: "complete" },
     });
