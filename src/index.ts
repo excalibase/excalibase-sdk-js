@@ -43,7 +43,7 @@ export type {
   UploadViaFunctionsOptions,
   UploadViaFunctionsResult,
 } from "./storage/client";
-export { ExcalibaseError, AuthError, NetworkError, ConfigError } from "./errors";
+export { ExcalibaseError, AuthError, NetworkError, ConfigError, CorsError } from "./errors";
 export type {
   User,
   Session,

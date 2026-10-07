@@ -1,6 +1,7 @@
 import { GraphQLClient } from "graphql-request";
 import { AuthClient } from "./auth";
-import { AuthError, ConfigError, NetworkError } from "./errors";
+import { AuthError, ConfigError, CorsError, NetworkError } from "./errors";
+import { corsAwareFetch } from "./cors";
 import { FunctionsNamespace } from "./functions/namespace";
 import type { DefaultFunctions } from "./functions/types";
 import { GraphqlNamespace } from "./graphql-ns";
@@ -123,7 +124,8 @@ export class DbClient<
     if (typeof rawFetch !== "function") {
       throw new ConfigError("global fetch is not available; pass `fetch` in createClient options");
     }
-    this.fetchImpl = rawFetch.bind(globalThis) as typeof fetch;
+    // A browser call refused by CORS rejects as a CorsError naming the page origin.
+    this.fetchImpl = corsAwareFetch(rawFetch.bind(globalThis) as typeof fetch);
     this.extraHeaders = { ...(opts.headers ?? {}) };
 
     this.auth = new AuthClient({
@@ -274,6 +276,7 @@ export class DbClient<
         body: body === undefined ? undefined : JSON.stringify(body),
       });
     } catch (error) {
+      if (error instanceof CorsError) throw error;
       throw new NetworkError(`REST request failed for ${method} ${path}`, error);
     }
     const text = await response.text();
@@ -341,6 +344,7 @@ function extractErrorMessage(parsed: unknown): string | null {
 }
 
 function wrapGraphqlError(error: unknown): Error {
+  if (error instanceof CorsError) return error;
   if (error instanceof Error) {
     const maybeResponse = (error as unknown as { response?: { status?: number } }).response;
     const status = maybeResponse?.status;

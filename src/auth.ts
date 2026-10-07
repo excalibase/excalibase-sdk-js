@@ -1,4 +1,4 @@
-import { AuthError, NetworkError } from "./errors";
+import { AuthError, CorsError, NetworkError } from "./errors";
 import type { StorageAdapter } from "./storage";
 import { computeExpiresAt, TokenManager } from "./token-manager";
 import type {
@@ -265,6 +265,7 @@ export class AuthClient {
         body: body === undefined ? undefined : JSON.stringify(body),
       });
     } catch (error) {
+      if (error instanceof CorsError) throw error;
       throw new NetworkError(`Auth request failed: ${method} ${url}`, error);
     }
     const text = await response.text();
