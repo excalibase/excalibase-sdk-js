@@ -43,6 +43,11 @@ in `NetworkError`. Pick `db.graphql` for shape control / nested projections /
 TS codegen; pick `db.rest` for HTTP-cacheable URLs / `Prefer: count=exact`
 pagination / piping through CDNs.
 
+In a browser, a call refused by CORS throws `CorsError` (a `NetworkError`,
+`code: "cors_blocked"`) whose `origin` is the page's own origin: add it in
+Studio → Settings → Allowed origins (for local development,
+`http://localhost:<port>`).
+
 ## Quick start
 
 ```ts

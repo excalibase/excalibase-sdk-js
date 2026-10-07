@@ -12,6 +12,7 @@
  * wrap it).
  */
 
+import { CorsError } from "../errors";
 import { FunctionsError, type ValidationIssue } from "./error";
 
 export interface FunctionsNamespaceOptions {
@@ -106,6 +107,7 @@ export class FunctionsNamespace<F = unknown> {
         body: JSON.stringify({ args }),
       });
     } catch (err) {
+      if (err instanceof CorsError) throw err;
       throw new FunctionsError(
         `network error invoking ${moduleName}.${exportName}: ${(err as Error).message ?? String(err)}`,
         { code: "network_error" },
