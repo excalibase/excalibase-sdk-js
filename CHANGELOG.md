@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.0
+
+### Minor Changes
+
+- 439ae4a: `db.storage` uploads, lists, downloads and deletes files through the platform's app storage API under the bucket's access rules, with no function to deploy: `uploadFile(blob, { bucket, path })`, `list`, `getDownloadUrl`, `download`, `remove`; refusals throw `StorageError`. The earlier function-based upload is `uploadViaFunctions(blob)`.
+- ead8157: In a browser, a request refused by CORS throws `CorsError` (a `NetworkError` with `code: "cors_blocked"`) that names the page's origin and says to add it in Studio → Settings → Allowed origins. An offline browser, a same-origin call or a server runtime keeps the plain `NetworkError`.
+
+### Patch Changes
+
+- 7014a43: A Node script that signs in with the SDK now exits when it finishes: the token-refresh timer no longer keeps the process alive.
+
 ## 0.11.0
 
 ### Minor Changes
