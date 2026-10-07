@@ -38,7 +38,7 @@ export class TokenManager {
     this.onError = opts.onError;
     this.leadTimeMs = opts.leadTimeMs ?? 60_000;
     this.now = opts.now ?? (() => Date.now());
-    this.setTimeoutFn = opts.setTimeout ?? ((fn, ms) => setTimeout(fn, ms));
+    this.setTimeoutFn = opts.setTimeout ?? defaultSetTimeout;
     this.clearTimeoutFn = opts.clearTimeout ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
   }
 
@@ -97,6 +97,15 @@ export class TokenManager {
       // via signInWithApiKey or surface the failure to the caller.
     }
   }
+}
+
+// A refresh timer must never keep a Node script alive; browsers return a number, which has no unref.
+function defaultSetTimeout(fn: () => void, ms: number): unknown {
+  const handle = setTimeout(fn, ms);
+  if (typeof handle === "object" && handle !== null && "unref" in handle) {
+    (handle as { unref(): void }).unref();
+  }
+  return handle;
 }
 
 export function computeExpiresAt(expiresInSeconds: number, now: number = Date.now()): number {
