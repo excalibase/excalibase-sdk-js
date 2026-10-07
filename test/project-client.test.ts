@@ -79,7 +79,7 @@ describe("createClient({ url, projectId, key }) builds every service path", () =
     await db.graphql.query("{ __typename }");
     await db.rest.get("/products?select=id");
     await (db.functions as unknown as { shop: { ping: (a: unknown) => Promise<unknown> } }).shop.ping({});
-    await db.storage.uploadFile(new Blob(["hi"], { type: "text/plain" }));
+    await db.storage.uploadViaFunctions(new Blob(["hi"], { type: "text/plain" }));
 
     expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([
       `POST ${URL_BASE}/auth/acme/proj-abc123/token`,

@@ -86,7 +86,8 @@ edge routes them:
 | Realtime (`db.graphql.subscribe`) | `ws(s)://{host}/{projectId}/graphql` |
 | REST (`db.rest`) | `{url}/{projectId}/api/v1/...` |
 | End-user auth (`db.auth`) | `{url}/auth/{orgSlug}/{projectId}/...` |
-| Functions and file uploads (`db.functions`, `db.storage`) | `{url}/functions/v1/{projectId}/{module}.{name}` |
+| Functions (`db.functions`, `db.storage.uploadViaFunctions`) | `{url}/functions/v1/{projectId}/{module}.{name}` |
+| Files (`db.storage`) | `{url}/storage/v1/{projectId}/buckets/{bucket}/...` |
 
 `orgSlug` is optional: auth finds the project by its id, so the org segment
 defaults to the project id. `db.graphqlEndpoint()`, `db.restEndpoint(path)`,
@@ -120,6 +121,43 @@ sub.unsubscribe();
 
 Browsers and Node 22+ have a global `WebSocket`. On older Node pass one:
 `createClient({ ..., WebSocket })` with `import WebSocket from "ws"`.
+
+## File storage
+
+Signed-in users upload, list, download and delete files straight from the
+browser; no function to deploy. The bytes go to the object store on a
+short-lived signed URL, so they never pass through the platform.
+
+In Studio, create the bucket and give it **App access** rules: per role,
+whether the user may read, write and delete `own` files (under a folder named
+after their user id) or `all` files. A role with no rule, and a bucket with
+none, refuses everything. Add your app's origin to the project's CORS list.
+
+```ts
+await db.auth.signInWithPassword({ email, password });
+const me = db.auth.user()!;
+
+// upload into the user's own folder
+const file = await db.storage.uploadFile(blob, {
+  bucket: "avatars",
+  path: `${me.id}/avatar.png`,
+});
+
+// list the user's files (a user with an "own" rule lists their folder)
+const { objects, nextCursor } = await db.storage.list("avatars");
+
+// a URL for an <img>, or the bytes
+const { url } = await db.storage.getDownloadUrl("avatars", `${me.id}/avatar.png`);
+const bytes = await db.storage.download("avatars", `${me.id}/avatar.png`);
+
+await db.storage.remove("avatars", `${me.id}/avatar.png`);
+```
+
+A refusal throws `StorageError` with the HTTP status (403 when the bucket's
+rules do not allow it). Private URLs expire; a public bucket's do not.
+
+`db.storage.uploadViaFunctions(blob)` keeps the older flow, which calls your
+own `system.generateUploadUrl` and `system.completeUpload` functions.
 
 ## Security
 
