@@ -134,6 +134,47 @@ describe("AuthClient.signInWithApiKey", () => {
   });
 });
 
+describe("AuthClient: anonymous sign-in has no user (EXC-607)", () => {
+  // What excalibase-auth answered for an api-key sign-in before EXC-607: a placeholder, not a person.
+  const placeholderUser = { id: 0, email: "", fullName: "" };
+
+  it("user() is null after signInWithApiKey, even when the server sends a placeholder user", async () => {
+    const { fetch: f } = makeFetch({
+      "POST /auth/acme/prod/token": () => ({ body: { ...apiKeyResponse(), user: placeholderUser } }),
+    });
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    const session = await db.auth.signInWithApiKey();
+    expect(session.user).toBeNull();
+    expect(db.auth.user()).toBeNull();
+  });
+
+  it("user() is null when the server sends no user", async () => {
+    const { fetch: f } = makeFetch({ "POST /auth/acme/prod/token": () => ({ body: apiKeyResponse() }) });
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await db.auth.signInWithApiKey();
+    expect(db.auth.user()).toBeNull();
+  });
+
+  it("a stored anonymous session with a placeholder user reads as no user", async () => {
+    const stored = { accessToken: "jwt-anon", refreshToken: null, tokenType: "Bearer", expiresAt: Date.now() + 60_000, user: placeholderUser };
+    const storage = { getItem: () => JSON.stringify(stored), setItem: () => undefined, removeItem: () => undefined };
+    const { fetch: f } = makeFetch({});
+    const db = createClient({ ...baseOpts, storage, fetch: f });
+    await db.auth.hydrate();
+    expect(db.auth.user()).toBeNull();
+  });
+
+  it("a signed-in user is unchanged", async () => {
+    const user = { id: 7, email: "alice@example.com", fullName: "Alice" };
+    const { fetch: f } = makeFetch({
+      "POST /auth/acme/prod/token": () => ({ body: { ...apiKeyResponse(), refreshToken: "r", user } }),
+    });
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await db.auth.signInWithPassword({ email: "alice@example.com", password: "s3cret" });
+    expect(db.auth.user()).toEqual(user);
+  });
+});
+
 describe("AuthClient.signUp", () => {
   it("POSTs /register and installs the session", async () => {
     let capturedBody: string | null = null;

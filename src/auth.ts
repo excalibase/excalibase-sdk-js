@@ -81,8 +81,9 @@ export class AuthClient {
       if (raw != null && raw.length > 0) {
         const parsed = JSON.parse(raw) as Session;
         if (typeof parsed.accessToken === "string" && typeof parsed.expiresAt === "number") {
-          this.session = parsed;
-          this.tokenManager.setSession(parsed);
+          const session = { ...parsed, user: endUser(parsed.user) };
+          this.session = session;
+          this.tokenManager.setSession(session);
         }
       }
     } catch {
@@ -198,7 +199,7 @@ export class AuthClient {
       refreshToken: raw.refreshToken ?? null,
       tokenType: raw.tokenType ?? "Bearer",
       expiresAt: computeExpiresAt(raw.expiresIn ?? 0),
-      user: raw.user ?? null,
+      user: endUser(raw.user),
     };
   }
 
@@ -293,4 +294,12 @@ function extractErrorMessage(parsed: unknown): string | null {
     if (typeof obj.message === "string") return obj.message;
   }
   return null;
+}
+
+/**
+ * The signed-in end user, or null. An api-key (anonymous) session has no user; older auth servers sent a
+ * placeholder `{ id: 0 }` for it, which must not read as someone signed in (EXC-607).
+ */
+function endUser(user: User | null | undefined): User | null {
+  return user != null && typeof user.id === "number" && user.id > 0 ? user : null;
 }
