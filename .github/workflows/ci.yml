@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -23,3 +26,21 @@ jobs:
       - run: npm run typecheck
       - run: npm run test:coverage
       - run: npm run build
+
+  # The SDK against a real excalibase-auth rather than mocked replies (EXC-607).
+  real-auth:
+    runs-on: ubuntu-latest
+    env:
+      SDK_REAL_AUTH_IMAGE: docker.io/excalibase/excalibase-auth:main-49f792b@sha256:76e0e2e3e2e3c06e44286097c7ece815a6261ada7d4074a83f0d25281347df0f
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: docker pull -q "$SDK_REAL_AUTH_IMAGE"
+      - run: npx jest test/real-auth.test.ts
+      - name: Remove the test's containers, even after a cancelled run
+        if: always()
+        run: docker rm -f $(docker ps -aq --filter label=sdk-real-auth) 2>/dev/null || true
