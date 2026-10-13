@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.1
+
+### Patch Changes
+
+- 0e81929: `db.auth.user()` is `null` after `signInWithApiKey()`: an anonymous session has no user, even when an older auth server answers a placeholder `{ id: 0 }`.
+
 ## 0.12.0
 
 ### Minor Changes
