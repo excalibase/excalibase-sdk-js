@@ -1,15 +1,11 @@
 /**
- * `db.functions.<module>.<name>(args)` — typed HTTP RPC namespace.
+ * `db.functions` — typed HTTP RPC namespace over `/functions/v1/{projectId}/{id}`.
  *
- * The Proxy resolves any property access as a module handle whose own
- * Proxy resolves the next property as the exported function name. Calling
- * the resolved property POSTs to
+ *   db.functions.invite(args)      → POST .../invite
+ *   db.functions.images.urls(args) → POST .../images.urls (a function whose id is `images.urls`)
  *
- *   ${url}/functions/v1/${projectId}/${moduleName}.${exportName}
- *
- * with `{ args }` as JSON. The returned promise resolves to the function's
- * unwrapped `data` payload (or the raw response when the server didn't
- * wrap it).
+ * Each call sends `{ args }` as JSON and resolves to the function's unwrapped
+ * `data` payload (or the raw response when the server didn't wrap it).
  */
 
 import { CorsError } from "../errors";
@@ -38,6 +34,7 @@ const RESERVED_TOP_KEYS = new Set<PropertyKey>([
   Symbol.toPrimitive,
   Symbol.toStringTag,
   "_invoke",
+  "_invokeId",
   "_postFunction",
   "url",
   "projectId",
@@ -45,9 +42,14 @@ const RESERVED_TOP_KEYS = new Set<PropertyKey>([
   "fetchImpl",
 ]);
 
+// A module handle is callable itself (the function whose id is the module
+// name) and its properties call the function `${module}.${export}`. The
+// arrow target has no non-configurable `prototype`, which a Proxy get trap
+// could not override.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function makeModuleHandle(ns: FunctionsNamespace<any>, moduleName: string): Record<string, unknown> {
-  return new Proxy({} as Record<string, unknown>, {
+  const callById = (args: unknown) => ns._invokeId(moduleName, args);
+  return new Proxy(callById as unknown as Record<string, unknown>, {
     get(_target, exportProp): unknown {
       if (typeof exportProp === "symbol") return undefined;
       if (exportProp === "then" || exportProp === "catch" || exportProp === "finally") {
@@ -55,6 +57,9 @@ function makeModuleHandle(ns: FunctionsNamespace<any>, moduleName: string): Reco
       }
       const exportName = String(exportProp);
       return (args: unknown) => ns._invoke(moduleName, exportName, args);
+    },
+    apply(_target, _thisArg, argList: unknown[]): unknown {
+      return callById(argList[0]);
     },
   });
 }
@@ -83,18 +88,19 @@ export class FunctionsNamespace<F = unknown> {
    * Plain HTTP invoke. Response `{data}` is unwrapped for back-compat.
    */
   async _invoke(moduleName: string, exportName: string, args: unknown): Promise<unknown> {
-    const text = await this._postFunction(moduleName, exportName, args);
+    return this._invokeId(`${moduleName}.${exportName}`, args);
+  }
+
+  /** Calls the function whose id is `id`. */
+  async _invokeId(id: string, args: unknown): Promise<unknown> {
+    const text = await this._postFunction(id, args);
     return text.parsed != null && typeof text.parsed === "object" && "data" in (text.parsed as Record<string, unknown>)
       ? (text.parsed as { data: unknown }).data
       : text.parsed;
   }
 
-  private async _postFunction(
-    moduleName: string,
-    exportName: string,
-    args: unknown,
-  ): Promise<{ parsed: unknown; status: number }> {
-    const url = `${this.url}/functions/v1/${this.projectId}/${moduleName}.${exportName}`;
+  private async _postFunction(id: string, args: unknown): Promise<{ parsed: unknown; status: number }> {
+    const url = `${this.url}/functions/v1/${this.projectId}/${encodeURIComponent(id)}`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...this.headersFactory(),
@@ -109,14 +115,14 @@ export class FunctionsNamespace<F = unknown> {
     } catch (err) {
       if (err instanceof CorsError) throw err;
       throw new FunctionsError(
-        `network error invoking ${moduleName}.${exportName}: ${(err as Error).message ?? String(err)}`,
+        `network error invoking ${id}: ${(err as Error).message ?? String(err)}`,
         { code: "network_error" },
       );
     }
     const text = await response.text();
     const parsed = text.length > 0 ? safeJsonParse(text) : null;
     if (!response.ok) {
-      const message = extractErrorMessage(parsed) ?? `functions ${moduleName}.${exportName} failed with ${response.status}`;
+      const message = extractErrorMessage(parsed) ?? `functions ${id} failed with ${response.status}`;
       const issues = extractIssues(parsed);
       throw new FunctionsError(message, {
         code: issues != null ? "validation" : "functions_error",

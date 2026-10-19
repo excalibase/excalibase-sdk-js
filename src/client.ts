@@ -71,9 +71,9 @@ export class DbClient<
   readonly graphql: GraphqlNamespace;
   readonly rest: RestNamespace;
   /**
-   * Typed RPC namespace: `db.functions.<module>.<name>(args)`. The proxy
-   * resolves `.<module>.<name>` to a POST against
-   * `{url}/functions/v1/{projectId}/{module}.{name}` with `{ args }`.
+   * Typed RPC namespace over `{url}/functions/v1/{projectId}/{id}`:
+   * `db.functions.<id>(args)`, or `db.functions.<a>.<b>(args)` for the id
+   * `a.b`. Each call POSTs `{ args }`.
    */
   readonly functions: Functions;
   /**
@@ -171,7 +171,7 @@ export class DbClient<
     return authUrl(this.target, subpath);
   }
 
-  /** `{url}/functions/v1/{projectId}/{name}`, where name is `module.export` */
+  /** `{url}/functions/v1/{projectId}/{name}`, where name is the function's id */
   functionsEndpoint(name: string): string {
     return functionsUrl(this.target, name);
   }
