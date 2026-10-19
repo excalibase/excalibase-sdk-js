@@ -54,7 +54,14 @@ export interface FunctionRef<TArgs, TResult> {
  * `createClient`. Permissive — any module / export, args/result are loose.
  */
 export interface DefaultFunctions {
-  [moduleName: string]: {
-    [exportName: string]: FunctionRef<Record<string, unknown>, unknown>;
-  };
+  [moduleName: string]: FunctionModule;
 }
+
+/**
+ * A module handle: callable itself (`db.functions.invite(args)` calls the
+ * function whose id is `invite`) and indexable by export
+ * (`db.functions.images.urls(args)` calls the id `images.urls`).
+ */
+export type FunctionModule = ((args?: Record<string, unknown>) => Promise<unknown>) & {
+  [exportName: string]: FunctionRef<Record<string, unknown>, unknown>;
+};

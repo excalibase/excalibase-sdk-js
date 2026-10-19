@@ -2,7 +2,7 @@ export { createClient, DbClient } from "./client";
 export { FunctionsNamespace } from "./functions/namespace";
 export { FunctionsError } from "./functions/error";
 export type { ValidationIssue } from "./functions/error";
-export type { FunctionRef, DefaultFunctions, FunctionKind } from "./functions/types";
+export type { FunctionRef, FunctionModule, DefaultFunctions, FunctionKind } from "./functions/types";
 export type { DatabaseShape, AnyDatabase, RowOf } from "./client";
 export { AuthClient } from "./auth";
 export { GraphqlNamespace } from "./graphql-ns";

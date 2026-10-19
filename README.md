@@ -91,13 +91,27 @@ edge routes them:
 | Realtime (`db.graphql.subscribe`) | `ws(s)://{host}/{projectId}/graphql` |
 | REST (`db.rest`) | `{url}/{projectId}/api/v1/...` |
 | End-user auth (`db.auth`) | `{url}/auth/{orgSlug}/{projectId}/...` |
-| Functions (`db.functions`, `db.storage.uploadViaFunctions`) | `{url}/functions/v1/{projectId}/{module}.{name}` |
+| Functions (`db.functions`, `db.storage.uploadViaFunctions`) | `{url}/functions/v1/{projectId}/{id}` |
 | Files (`db.storage`) | `{url}/storage/v1/{projectId}/buckets/{bucket}/...` |
 
 `orgSlug` is optional: auth finds the project by its id, so the org segment
 defaults to the project id. `db.graphqlEndpoint()`, `db.restEndpoint(path)`,
 `db.authEndpoint(path)`, `db.functionsEndpoint(name)` and
 `db.realtimeEndpoint()` return the URLs the client uses.
+
+A function is reached by its id. `db.functions.invite(args)` calls the
+function whose id is `invite`; `db.functions.images.urls(args)` calls the one
+whose id is `images.urls`. Both send `{"args": ...}` as the JSON body and
+resolve to `data` when the function answers `{"data": ...}`. The function
+itself is `export default (req: Request) => Response`:
+
+```ts
+// index.ts of the function `invite`
+export default async (req: Request): Promise<Response> => {
+  const { args } = await req.json();
+  return Response.json({ data: { invited: args.email } });
+};
+```
 
 Older options still work: `publishableKey` is read as `key`, and a
 `projectId` of the form `"{orgSlug}/{projectId}"` is read as the org and the
