@@ -187,10 +187,14 @@ function scalarToTs(scalar: string): string {
   switch (scalar) {
     case "Int":
     case "Float":
-    case "BigInt":
       return "number";
     case "Boolean":
       return "boolean";
+    // Bigints and decimals arrive as strings holding every digit; a JS number would round them.
+    case "BigInt":
+    case "BigInteger":
+    case "BigDecimal":
+    case "Long":
     case "ID":
     case "String":
     case "Date":

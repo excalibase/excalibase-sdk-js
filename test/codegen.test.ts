@@ -46,6 +46,26 @@ describe("parseIntrospection", () => {
     expect(cols.priority?.nullable).toBe(true);
   });
 
+  it("types bigints and decimals as strings, the form the API answers them in", () => {
+    const withNumbers = JSON.parse(JSON.stringify(introspection));
+    const issue = withNumbers.__schema.types.find((t: { name: string }) => t.name === "KanbanIssue");
+    const scalar = (name: string) => ({ kind: "NON_NULL", ofType: { kind: "SCALAR", name } });
+    issue.fields.push(
+      { name: "big_id", type: scalar("BigInteger"), args: [] },
+      { name: "amount", type: scalar("BigDecimal"), args: [] },
+      { name: "legacy_big", type: scalar("BigInt"), args: [] },
+      { name: "ratio", type: scalar("Float"), args: [] },
+    );
+    const parsed = parseIntrospection(withNumbers, codegenOpts);
+    const cols = Object.fromEntries(
+      parsed.tables.find((t) => t.field === "kanbanIssues")!.columns.map((c) => [c.name, c]),
+    );
+    expect(cols.big_id?.tsType).toBe("string");
+    expect(cols.amount?.tsType).toBe("string");
+    expect(cols.legacy_big?.tsType).toBe("string");
+    expect(cols.ratio?.tsType).toBe("number");
+  });
+
   it("collects all enum types with their members", () => {
     const parsed = parseIntrospection(introspection, codegenOpts);
     const enumNames = parsed.enums.map((e) => e.name).sort();
