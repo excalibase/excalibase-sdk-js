@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.0
+
+### Minor Changes
+
+- bdd1bc6: `db.functions.<id>(args)` calls a function whose id has no dot, such as one named `invite` in Studio or with `deploy_function`; `db.functions.<a>.<b>(args)` still calls the id `a.b`.
+- fb5f4ea: Numeric/decimal and bigint fields are now strings, in GraphQL and REST, on Postgres and MySQL: the API sends them as strings holding every digit (`"19.90"`, `"9223372036854775807"`), because a JavaScript number rounds past 2^53 and loses decimal digits. Generated types say `string` for `BigInteger`, `BigDecimal`, `BigInt` and `Long` columns. Filters and writes still accept a number or a string. If your code does arithmetic on these fields, convert first (`Number(row.price)` when rounding is fine, or a decimal library when it is not).
+
+### Patch Changes
+
+- 0e81929: `db.auth.user()` is `null` after `signInWithApiKey()`: an anonymous session has no user, even when an older auth server answers a placeholder `{ id: 0 }`.
+
 ## 0.12.0
 
 ### Minor Changes
