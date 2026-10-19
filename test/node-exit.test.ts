@@ -6,6 +6,8 @@ import { join } from "node:path";
 
 // A script that signs in and queries must let Node exit on its own: the
 // token-refresh timer may not keep the event loop alive.
+// The build bypasses tsup.config.ts: its two configs both write index.js into
+// the same out-dir concurrently and corrupt it, so the script sometimes failed to load.
 describe("a Node script using the SDK", () => {
   let server: Server;
   let baseUrl: string;
@@ -15,7 +17,7 @@ describe("a Node script using the SDK", () => {
     outDir = mkdtempSync(join(__dirname, "..", "node_modules", ".sdk-exit-"));
     execFileSync(
       "npx",
-      ["tsup", "src/index.ts", "--format", "cjs", "--out-dir", outDir, "--no-dts", "--no-sourcemap", "--platform", "node"],
+      ["tsup", "--no-config", "src/index.ts", "--format", "cjs", "--out-dir", outDir, "--no-dts", "--no-sourcemap", "--platform", "node"],
       { cwd: join(__dirname, ".."), stdio: "pipe" },
     );
     server = createServer((req, res) => {
