@@ -5,6 +5,7 @@ export type { ValidationIssue } from "./functions/error";
 export type { FunctionRef, FunctionModule, DefaultFunctions, FunctionKind } from "./functions/types";
 export type { DatabaseShape, AnyDatabase, RowOf } from "./client";
 export { AuthClient } from "./auth";
+export type { HistoryLike, LocationLike, OAuthProvider, OAuthRedirect, SignInWithOAuthOptions } from "./oauth";
 export { GraphqlNamespace } from "./graphql-ns";
 export { RestNamespace } from "./rest-ns";
 export { QueryBuilder, str, unquoted } from "./query-builder";
