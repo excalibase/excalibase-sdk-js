@@ -46,7 +46,10 @@ async function waitFor(check: () => Promise<boolean>, what: string, seconds = 60
   throw new Error(`${what} did not come up`);
 }
 
-/** Stands in for provisioning: the token-signing key, project info and the project's database login. */
+/** What auth asked provisioning to mail, newest last. */
+const sentMail: Array<{ to: string; template: string; data: Record<string, string> }> = [];
+
+/** Stands in for provisioning: the token-signing key, project info, the mail relay and the project's database login. */
 function fakeProvisioning(pgPort: number): Server {
   const { privateKey } = generateKeyPairSync("ec", {
     namedCurve: "prime256v1",
@@ -59,7 +62,14 @@ function fakeProvisioning(pgPort: number): Server {
     if (path === "/vault/secrets/pki/signing/private") {
       response.end(JSON.stringify({ key: privateKey, algorithm: "EC-P256" }));
     } else if (path === `/projects/${PROJECT}/info`) {
-      response.end(JSON.stringify({ projectId: PROJECT, orgSlug: ORG, corsAllowedOrigins: [] }));
+      response.end(JSON.stringify({ projectId: PROJECT, orgSlug: ORG, corsAllowedOrigins: [], siteUrl: "https://app.example.com" }));
+    } else if (path === "/internal/email/send") {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        sentMail.push(JSON.parse(body));
+        response.end("{}");
+      });
     } else {
       response.end(JSON.stringify({
         host: "127.0.0.1", port: String(pgPort), database: DB.database, username: DB.user, password: DB.password,
@@ -151,5 +161,29 @@ describeReal("SDK against a real excalibase-auth", () => {
     await db.auth.signUp({ email, password: randomBytes(12).toString("hex"), fullName: "Real Auth" });
     expect(db.auth.user()).toEqual(expect.objectContaining({ email, id: expect.any(Number) }));
     expect(db.auth.user()?.id).toBeGreaterThan(0);
+  });
+
+  it("password reset: same answer for a stranger, and the mailed token sets a new password", async () => {
+    const db = client(seedKey("pub"));
+    const email = `sdk-reset-${run}@example.com`;
+    await db.auth.signUp({ email, password: randomBytes(12).toString("hex"), fullName: "Reset" });
+
+    await expect(db.auth.resetPasswordForEmail(`nobody-${run}@example.com`)).resolves.toBeUndefined();
+    await expect(db.auth.resetPasswordForEmail(email)).resolves.toBeUndefined();
+    const mail = sentMail.filter((m) => m.to === email && m.template === "password_reset").pop();
+    const token = new URL(mail?.data.resetUrl ?? "https://x/").searchParams.get("token") ?? "";
+    expect(token.length).toBeGreaterThan(0);
+
+    const fresh = `N3w-${randomBytes(8).toString("hex")}`;
+    await db.auth.updatePasswordWithToken({ token, password: fresh });
+    await expect(db.auth.updatePasswordWithToken({ token, password: fresh })).rejects.toMatchObject({ status: 400 });
+    const session = await db.auth.signInWithPassword({ email, password: fresh });
+    expect(session.user?.email).toBe(email);
+  });
+
+  it("email verification: resend answers alike, and a bad token is refused", async () => {
+    const db = client(seedKey("pub"));
+    await expect(db.auth.resendVerification({ email: `nobody-${run}@example.com` })).resolves.toBeUndefined();
+    await expect(db.auth.verifyEmail({ token: "not-a-real-token" })).rejects.toMatchObject({ status: 400 });
   });
 });
