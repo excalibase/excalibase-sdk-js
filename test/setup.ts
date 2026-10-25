@@ -12,3 +12,9 @@ if (typeof globalThis.fetch === "undefined") {
   // @ts-expect-error
   globalThis.Response = Response;
 }
+
+// Node 18 keeps Web Crypto off the global object; browsers and Node 20+ have it.
+if (typeof globalThis.crypto?.subtle === "undefined") {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  Object.defineProperty(globalThis, "crypto", { value: require("node:crypto").webcrypto, configurable: true });
+}
