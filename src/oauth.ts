@@ -93,3 +93,62 @@ export function defaultHistory(): HistoryLike | undefined {
   const history = (globalThis as { history?: HistoryLike }).history;
   return history != null && typeof history.replaceState === "function" ? history : undefined;
 }
+
+/** A sign-in this browser started, kept until it lands back or goes stale. */
+export interface PendingSignIn {
+  verifier: string;
+  redirectTo: string;
+  startedAt: number;
+}
+
+/** How long a started sign-in may take, as long as auth keeps its state. */
+export const PENDING_SIGN_IN_TTL_MS = 10 * 60 * 1000;
+
+export function encodePending(pending: PendingSignIn): string {
+  return JSON.stringify(pending);
+}
+
+export function decodePending(raw: string | null, now: number): PendingSignIn | null {
+  if (raw == null || raw.length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<PendingSignIn>;
+    if (typeof parsed.verifier !== "string" || typeof parsed.redirectTo !== "string" || typeof parsed.startedAt !== "number") {
+      return null;
+    }
+    if (now - parsed.startedAt > PENDING_SIGN_IN_TTL_MS || parsed.startedAt > now) return null;
+    return parsed as PendingSignIn;
+  } catch {
+    return null;
+  }
+}
+
+/** The page is the one the sign-in was sent back to: same origin and path. */
+export function landedOn(href: string, redirectTo: string): boolean {
+  try {
+    const page = new URL(href);
+    const target = new URL(redirectTo);
+    return page.origin === target.origin && trimSlash(page.pathname) === trimSlash(target.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function trimSlash(path: string): string {
+  return path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
+}
+
+/** The codes auth sends back; anything else on the address is not auth's. */
+const SIGN_IN_ERRORS = new Set([
+  "access_denied",
+  "server_error",
+  "temporarily_unavailable",
+  "method_not_enabled",
+  "email_not_verified",
+  "signup_disabled",
+  "account_disabled",
+  "invalid_email",
+]);
+
+export function signInErrorCode(raw: string | null): string {
+  return raw != null && SIGN_IN_ERRORS.has(raw) ? raw : "server_error";
+}

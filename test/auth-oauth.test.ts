@@ -12,6 +12,10 @@ const baseOpts = {
 
 const verifierKey = "excalibase.auth.session:acme/prod-code-verifier";
 
+function keep(storage: StorageAdapter, redirectTo = "https://app.test/cb", startedAt = Date.now()): void {
+  storage.setItem(verifierKey, JSON.stringify({ verifier: "v".repeat(43), redirectTo, startedAt }));
+}
+
 function s256(verifier: string): string {
   return createHash("sha256").update(verifier).digest("base64url");
 }
@@ -50,7 +54,9 @@ describe("AuthClient.signInWithOAuth", () => {
     expect(parsed.searchParams.get("provider")).toBe("github");
     expect(parsed.searchParams.get("redirect_to")).toBe("https://app.test/auth/callback");
     expect(parsed.searchParams.get("code_challenge_method")).toBe("S256");
-    const verifier = storage.getItem(verifierKey) as string;
+    const kept = JSON.parse(storage.getItem(verifierKey) as string);
+    expect(kept.redirectTo).toBe("https://app.test/auth/callback");
+    const verifier = kept.verifier as string;
     expect(verifier).toMatch(/^[A-Za-z0-9_-]{43,128}$/);
     expect(parsed.searchParams.get("code_challenge")).toBe(s256(verifier));
   });
@@ -83,7 +89,7 @@ describe("AuthClient.signInWithOAuth", () => {
 describe("AuthClient.exchangeCodeForSession", () => {
   it("redeems the code with the kept verifier once, then forgets the verifier", async () => {
     const storage = memoryStorageAdapter();
-    storage.setItem(verifierKey, "v".repeat(43));
+    keep(storage);
     const { fetch: f, calls } = tokenFetch();
     const db = createClient({ ...baseOpts, storage, fetch: f });
     const events: string[] = [];
@@ -107,7 +113,7 @@ describe("AuthClient.exchangeCodeForSession", () => {
 
   it("surfaces a refused code as AuthError and still forgets the verifier", async () => {
     const storage = memoryStorageAdapter();
-    storage.setItem(verifierKey, "v".repeat(43));
+    keep(storage);
     const db = createClient({ ...baseOpts, storage, fetch: tokenFetch(400, { error: "invalid or expired code" }).fetch });
     await expect(db.auth.exchangeCodeForSession("bad")).rejects.toMatchObject({ status: 400 });
     expect(storage.getItem(verifierKey)).toBeNull();
@@ -131,7 +137,7 @@ describe("AuthClient.hydrate finishes a sign-in that landed back on the page", (
 
   it("exchanges ?code= and removes it from the address bar", async () => {
     const storage = memoryStorageAdapter();
-    storage.setItem(verifierKey, "v".repeat(43));
+    keep(storage);
     const { fetch: f, calls } = tokenFetch();
     const { db, replaceState } = landedAt("https://app.test/cb?code=abc&next=%2Fhome", storage, f);
     const session = await db.auth.hydrate();
@@ -148,9 +154,30 @@ describe("AuthClient.hydrate finishes a sign-in that landed back on the page", (
     expect(replaceState).not.toHaveBeenCalled();
   });
 
+  it("ignores a ?code= on another page, or a sign-in that went stale", async () => {
+    const { fetch: f, calls } = tokenFetch();
+    const other = memoryStorageAdapter();
+    keep(other, "https://app.test/auth/callback");
+    await landedAt("https://app.test/invite?code=abc", other, f).db.auth.hydrate();
+    const stale = memoryStorageAdapter();
+    keep(stale, "https://app.test/cb", Date.now() - 11 * 60 * 1000);
+    await landedAt("https://app.test/cb?code=abc", stale, f).db.auth.hydrate();
+    expect(calls).toHaveLength(0);
+    await expect(createClient({ ...baseOpts, storage: stale, fetch: f }).auth.exchangeCodeForSession("abc")).rejects.toMatchObject({
+      code: "pkce_verifier_missing",
+    });
+  });
+
+  it("an ?error= auth never sends is reported as server_error, not echoed", async () => {
+    const storage = memoryStorageAdapter();
+    keep(storage);
+    const { db } = landedAt("https://app.test/cb?error=%3Cimg%20src%3Dx%3E", storage, tokenFetch().fetch);
+    await expect(db.auth.hydrate()).rejects.toMatchObject({ code: "server_error", message: "Sign-in failed: server_error" });
+  });
+
   it("does nothing when detectSessionInUrl is false", async () => {
     const storage = memoryStorageAdapter();
-    storage.setItem(verifierKey, "v".repeat(43));
+    keep(storage);
     const { fetch: f, calls } = tokenFetch();
     const { db } = landedAt("https://app.test/cb?code=abc", storage, f, false);
     await db.auth.hydrate();
@@ -159,7 +186,7 @@ describe("AuthClient.hydrate finishes a sign-in that landed back on the page", (
 
   it("an ?error= ends the sign-in: the verifier is dropped and hydrate reports it", async () => {
     const storage = memoryStorageAdapter();
-    storage.setItem(verifierKey, "v".repeat(43));
+    keep(storage);
     const { fetch: f, calls } = tokenFetch();
     const { db, replaceState } = landedAt("https://app.test/cb?error=signup_disabled", storage, f);
     await expect(db.auth.hydrate()).rejects.toMatchObject({ code: "signup_disabled" });
