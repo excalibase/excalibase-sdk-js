@@ -93,6 +93,15 @@ export interface CreateClientOptions {
   storage?: import("./storage").StorageAdapter;
   storageKey?: string;
   autoRefreshToken?: boolean;
+  /**
+   * Finish a Google/GitHub sign-in when `hydrate()` finds `?code=` on the
+   * page and this browser started one. Default true.
+   */
+  detectSessionInUrl?: boolean;
+  /** The page's address; defaults to `window.location` in a browser. */
+  location?: import("./oauth").LocationLike;
+  /** Defaults to `window.history`; used to drop `?code=` from the address bar. */
+  history?: import("./oauth").HistoryLike;
   fetch?: typeof fetch;
   /**
    * WebSocket constructor for `db.graphql.subscribe`. Defaults to the

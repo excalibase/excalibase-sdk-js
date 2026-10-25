@@ -257,6 +257,22 @@ await db.auth.updatePasswordWithToken({ token, password: newPassword });
 `resendVerification` and `resetPasswordForEmail` resolve the same way whether or not the account exists.
 Verifying an address and resetting a password both end every session the account had.
 
+## Sign in with Google or GitHub
+
+The project's Admin turns a provider on in Studio with the project's own OAuth app, and lists the app's redirect URLs.
+
+```ts
+// Sends the browser to the provider; it comes back to redirectTo?code=...
+await db.auth.signInWithOAuth({ provider: "github", redirectTo: "https://app.example.com/auth/callback" });
+
+// On the page it comes back to: finishes the sign-in and drops ?code= from the address bar.
+const session = await db.auth.hydrate();
+```
+
+The code is redeemed with a PKCE verifier this browser kept, so a code copied elsewhere is useless.
+`exchangeCodeForSession(code)` does the same step by hand. A failed sign-in comes back as `?error=<code>`,
+which `hydrate()` raises as an `AuthError` with that code (`signup_disabled`, `email_not_verified`, `access_denied`, ...).
+
 ## API key management
 
 Authenticated users can mint and revoke API keys for the current project:

@@ -1,4 +1,18 @@
 import { AuthError, CorsError, NetworkError } from "./errors";
+import {
+  codeChallenge,
+  decodePending,
+  encodePending,
+  type HistoryLike,
+  landedOn,
+  type LocationLike,
+  newCodeVerifier,
+  type OAuthRedirect,
+  readLandedSignIn,
+  signInErrorCode,
+  type SignInWithOAuthOptions,
+  validateOAuthOptions,
+} from "./oauth";
 import type { StorageAdapter } from "./storage";
 import { computeExpiresAt, TokenManager } from "./token-manager";
 import type {
@@ -40,6 +54,10 @@ export interface AuthClientOptions {
   storageKey: string;
   autoRefreshToken: boolean;
   fetch: typeof fetch;
+  /** Finish a provider sign-in found on the page's address during hydrate(). */
+  detectSessionInUrl?: boolean;
+  location?: LocationLike;
+  history?: HistoryLike;
 }
 
 /**
@@ -60,12 +78,18 @@ export class AuthClient {
   private readonly tokenManager: TokenManager;
   private session: Session | null = null;
   private hydrated = false;
+  private readonly detectSessionInUrl: boolean;
+  private readonly location?: LocationLike;
+  private readonly history?: HistoryLike;
 
   constructor(opts: AuthClientOptions) {
     this.host = opts.client;
     this.storage = opts.storage;
     this.storageKey = opts.storageKey;
     this.fetchImpl = opts.fetch;
+    this.detectSessionInUrl = opts.detectSessionInUrl ?? true;
+    this.location = opts.location;
+    this.history = opts.history;
     this.tokenManager = new TokenManager({
       session: null,
       refresh: () => this.refresh(),
@@ -100,7 +124,66 @@ export class AuthClient {
     } catch {
       // Ignore malformed storage — treat as no session.
     }
+    if (this.detectSessionInUrl) {
+      await this.finishLandedSignIn();
+    }
     return this.session;
+  }
+
+  /**
+   * Starts a sign-in with Google or GitHub: keeps a PKCE verifier in storage
+   * and sends the browser to auth, which returns it to `redirectTo?code=…`.
+   */
+  async signInWithOAuth(options: SignInWithOAuthOptions): Promise<OAuthRedirect> {
+    validateOAuthOptions(options);
+    const verifier = newCodeVerifier();
+    const challenge = await codeChallenge(verifier);
+    const pending = encodePending({ verifier, redirectTo: options.redirectTo, startedAt: Date.now() });
+    await Promise.resolve(this.storage.setItem(this.verifierKey, pending));
+    const query = new URLSearchParams({
+      provider: options.provider,
+      redirect_to: options.redirectTo,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    const url = `${this.host.authEndpoint("/authorize")}?${query.toString()}`;
+    if (options.skipBrowserRedirect !== true) {
+      this.location?.assign(url);
+    }
+    return { provider: options.provider, url };
+  }
+
+  /** Redeems the code a provider sign-in returned, with the verifier this browser kept. */
+  async exchangeCodeForSession(code: string): Promise<Session> {
+    const pending = decodePending(await Promise.resolve(this.storage.getItem(this.verifierKey)), Date.now());
+    await Promise.resolve(this.storage.removeItem(this.verifierKey));
+    if (pending == null) {
+      throw new AuthError("No sign-in was started in this browser, or it expired", "pkce_verifier_missing");
+    }
+    const body = { grant_type: "pkce", auth_code: code, code_verifier: pending.verifier };
+    const raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/token"), body);
+    const session = this.sessionFromResponse(raw);
+    this.installSession(session, "SIGNED_IN", { persist: true });
+    return session;
+  }
+
+  private get verifierKey(): string {
+    return `${this.storageKey}-code-verifier`;
+  }
+
+  /** Only a sign-in this browser started is finished; any other ?code= is the app's own. */
+  private async finishLandedSignIn(): Promise<void> {
+    const landed = this.location == null ? null : readLandedSignIn(this.location.href);
+    if (landed == null) return;
+    const pending = decodePending(await Promise.resolve(this.storage.getItem(this.verifierKey)), Date.now());
+    if (pending == null || !landedOn(this.location!.href, pending.redirectTo)) return;
+    this.history?.replaceState(null, "", landed.cleaned);
+    if (landed.error != null || landed.code == null) {
+      await Promise.resolve(this.storage.removeItem(this.verifierKey));
+      const code = signInErrorCode(landed.error);
+      throw new AuthError(`Sign-in failed: ${code}`, code);
+    }
+    await this.exchangeCodeForSession(landed.code);
   }
 
   onAuthStateChange(handler: AuthChangeHandler): Subscription {

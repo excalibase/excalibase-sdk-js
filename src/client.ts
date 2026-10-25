@@ -1,6 +1,7 @@
 import { GraphQLClient } from "graphql-request";
 import { AuthClient } from "./auth";
 import { AuthError, ConfigError, CorsError, NetworkError } from "./errors";
+import { defaultHistory, defaultLocation } from "./oauth";
 import { corsAwareFetch } from "./cors";
 import { FunctionsNamespace } from "./functions/namespace";
 import type { DefaultFunctions } from "./functions/types";
@@ -133,6 +134,9 @@ export class DbClient<
       storage: this.tokenStorage,
       storageKey: this.storageKey,
       autoRefreshToken: opts.autoRefreshToken ?? true,
+      detectSessionInUrl: opts.detectSessionInUrl ?? true,
+      location: opts.location ?? defaultLocation(),
+      history: opts.history ?? defaultHistory(),
       fetch: this.fetchImpl,
     });
     this.graphql = new GraphqlNamespace(this);
