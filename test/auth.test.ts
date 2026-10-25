@@ -374,3 +374,112 @@ describe("AuthClient api key CRUD", () => {
     expect(deleted).toBe(true);
   });
 });
+
+describe("AuthClient email verification and password reset", () => {
+  const neutralResend = { message: "If the account exists and is unverified, a verification email has been sent" };
+  const neutralForgot = { message: "If the account exists, a password reset email has been sent" };
+
+  function bodyOf(init: RequestInit): unknown {
+    return JSON.parse(init.body as string);
+  }
+
+  it("verifyEmail POSTs the token and reports what the server proved", async () => {
+    let sent: unknown = null;
+    const { fetch: f } = makeFetch({
+      "POST /auth/acme/prod/verify-email": ({ init }) => {
+        sent = bodyOf(init);
+        return { body: { verified: true, passwordResetRequired: true } };
+      },
+    });
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    const result = await db.auth.verifyEmail({ token: "tok-1" });
+    expect(sent).toEqual({ token: "tok-1" });
+    expect(result).toEqual({ verified: true, passwordResetRequired: true });
+  });
+
+  it("verifyEmail defaults passwordResetRequired to false when the server leaves it out", async () => {
+    const { fetch: f } = makeFetch({
+      "POST /auth/acme/prod/verify-email": () => ({ body: { verified: true } }),
+    });
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    expect(await db.auth.verifyEmail({ token: "tok-1" })).toEqual({ verified: true, passwordResetRequired: false });
+  });
+
+  it("verifyEmail raises AuthError for a spent or unknown token", async () => {
+    const { fetch: f } = makeFetch({
+      "POST /auth/acme/prod/verify-email": () => ({ status: 400, body: { error: "token is invalid or expired" } }),
+    });
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await expect(db.auth.verifyEmail({ token: "spent" })).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("verifyEmail refuses an empty token without a request", async () => {
+    const { fetch: f, calls } = makeFetch({});
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await expect(db.auth.verifyEmail({ token: "" })).rejects.toBeInstanceOf(AuthError);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("resendVerification POSTs the address and resolves with nothing to tell accounts apart", async () => {
+    let sent: unknown = null;
+    const { fetch: f } = makeFetch({
+      "POST /auth/acme/prod/resend-verification": ({ init }) => {
+        sent = bodyOf(init);
+        return { body: neutralResend };
+      },
+    });
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await expect(db.auth.resendVerification({ email: "a@b.c" })).resolves.toBeUndefined();
+    expect(sent).toEqual({ email: "a@b.c" });
+  });
+
+  it("resetPasswordForEmail POSTs /forgot-password and resolves with nothing", async () => {
+    let sent: unknown = null;
+    const { fetch: f } = makeFetch({
+      "POST /auth/acme/prod/forgot-password": ({ init }) => {
+        sent = bodyOf(init);
+        return { body: neutralForgot };
+      },
+    });
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await expect(db.auth.resetPasswordForEmail("a@b.c")).resolves.toBeUndefined();
+    expect(sent).toEqual({ email: "a@b.c" });
+  });
+
+  it("resetPasswordForEmail surfaces a throttle as AuthError 429", async () => {
+    const { fetch: f } = makeFetch({
+      "POST /auth/acme/prod/forgot-password": () => ({ status: 429, body: { error: "too_many_requests" } }),
+    });
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await expect(db.auth.resetPasswordForEmail("a@b.c")).rejects.toMatchObject({ status: 429, message: "too_many_requests" });
+  });
+
+  it("updatePasswordWithToken POSTs /reset-password with the server's field names", async () => {
+    let sent: unknown = null;
+    const { fetch: f } = makeFetch({
+      "POST /auth/acme/prod/reset-password": ({ init }) => {
+        sent = bodyOf(init);
+        return { body: { message: "Password has been reset" } };
+      },
+    });
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await expect(db.auth.updatePasswordWithToken({ token: "rt", password: "n3w-Passw0rd!" })).resolves.toBeUndefined();
+    expect(sent).toEqual({ token: "rt", newPassword: "n3w-Passw0rd!" });
+  });
+
+  it("updatePasswordWithToken refuses an empty token or password without a request", async () => {
+    const { fetch: f, calls } = makeFetch({});
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await expect(db.auth.updatePasswordWithToken({ token: "", password: "x" })).rejects.toBeInstanceOf(AuthError);
+    await expect(db.auth.updatePasswordWithToken({ token: "t", password: "" })).rejects.toBeInstanceOf(AuthError);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("an address is required for resend and reset", async () => {
+    const { fetch: f, calls } = makeFetch({});
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await expect(db.auth.resendVerification({ email: " " })).rejects.toBeInstanceOf(AuthError);
+    await expect(db.auth.resetPasswordForEmail("")).rejects.toBeInstanceOf(AuthError);
+    expect(calls).toHaveLength(0);
+  });
+});

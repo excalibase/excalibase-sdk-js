@@ -241,6 +241,22 @@ await db.graphql.query(`
 
 See the [excalibase-graphql search & vector guide](https://github.com/excalibase/excalibase-graphql/blob/main/docs/features/search-and-vector.md) for the full operator reference.
 
+## Email verification and password reset
+
+Links in auth's emails point at the project's site URL with a `?token=`; your pages pass it back:
+
+```ts
+// /verify?token=...
+const { passwordResetRequired } = await db.auth.verifyEmail({ token });
+
+await db.auth.resendVerification({ email });
+await db.auth.resetPasswordForEmail(email);           // mails /reset-password?token=...
+await db.auth.updatePasswordWithToken({ token, password: newPassword });
+```
+
+`resendVerification` and `resetPasswordForEmail` resolve the same way whether or not the account exists.
+Verifying an address and resetting a password both end every session the account had.
+
 ## API key management
 
 Authenticated users can mint and revoke API keys for the current project:

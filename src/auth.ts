@@ -23,6 +23,17 @@ export interface SignUpCredentials {
   fullName: string;
 }
 
+export interface VerifyEmailResult {
+  verified: boolean;
+  /** The link proved only the address, so the stored password was disabled and a reset email was sent. */
+  passwordResetRequired: boolean;
+}
+
+export interface UpdatePasswordWithTokenInput {
+  token: string;
+  password: string;
+}
+
 export interface AuthClientOptions {
   client: AuthClientHost;
   storage: StorageAdapter;
@@ -176,6 +187,38 @@ export class AuthClient {
     return null;
   }
 
+  /** Redeems the token from a verification email. The server ends every session the account had. */
+  async verifyEmail(input: { token: string }): Promise<VerifyEmailResult> {
+    requireValue(input.token, "token is required");
+    const raw = await this.postJSON<{ verified?: boolean; passwordResetRequired?: boolean }>(
+      this.host.authEndpoint("/verify-email"),
+      { token: input.token },
+    );
+    return { verified: raw.verified === true, passwordResetRequired: raw.passwordResetRequired === true };
+  }
+
+  /** Asks for a new verification email. Resolves the same way whether or not the account exists. */
+  async resendVerification(input: { email: string }): Promise<void> {
+    requireValue(input.email, "email is required");
+    await this.postJSON(this.host.authEndpoint("/resend-verification"), { email: input.email });
+  }
+
+  /** Asks for a password reset email. Resolves the same way whether or not the account exists. */
+  async resetPasswordForEmail(email: string): Promise<void> {
+    requireValue(email, "email is required");
+    await this.postJSON(this.host.authEndpoint("/forgot-password"), { email });
+  }
+
+  /** Sets a new password with the token from a reset email. The server ends every session the account had. */
+  async updatePasswordWithToken(input: UpdatePasswordWithTokenInput): Promise<void> {
+    requireValue(input.token, "token is required");
+    requireValue(input.password, "password is required");
+    await this.postJSON(this.host.authEndpoint("/reset-password"), {
+      token: input.token,
+      newPassword: input.password,
+    });
+  }
+
   async createApiKey(input: { name: string; keyType: "publishable" | "secret" }): Promise<CreateAPIKeyResult> {
     return this.postJSON<CreateAPIKeyResult>(this.host.authEndpoint("/api-keys/"), input);
   }
@@ -276,6 +319,12 @@ export class AuthClient {
       throw new AuthError(message, `http_${response.status}`, response.status, parsed);
     }
     return (parsed ?? ({} as T)) as T;
+  }
+}
+
+function requireValue(value: string | undefined, message: string): void {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new AuthError(message, "invalid_request");
   }
 }
 

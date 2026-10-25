@@ -60,4 +60,6 @@ export type {
 export type {
   SignInWithPasswordCredentials,
   SignUpCredentials,
+  UpdatePasswordWithTokenInput,
+  VerifyEmailResult,
 } from "./auth";
