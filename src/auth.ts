@@ -13,6 +13,7 @@ import {
   type SignInWithOAuthOptions,
   validateOAuthOptions,
 } from "./oauth";
+import { namedOtpError, readLandedLink, type SignInWithOtpOptions, validateOtpOptions, type VerifyOtpParams } from "./otp";
 import type { StorageAdapter } from "./storage";
 import { computeExpiresAt, TokenManager } from "./token-manager";
 import type {
@@ -126,6 +127,7 @@ export class AuthClient {
     }
     if (this.detectSessionInUrl) {
       await this.finishLandedSignIn();
+      await this.finishLandedLink();
     }
     return this.session;
   }
@@ -169,6 +171,72 @@ export class AuthClient {
 
   private get verifierKey(): string {
     return `${this.storageKey}-code-verifier`;
+  }
+
+  private get otpVerifierKey(): string {
+    return `${this.storageKey}-otp-verifier`;
+  }
+
+  /**
+   * Emails a sign-in link or six-digit code. Resolves the same way whether or not the account exists; the
+   * link or code then works only in this browser, which keeps the PKCE verifier.
+   */
+  async signInWithOtp(options: SignInWithOtpOptions): Promise<void> {
+    const type = validateOtpOptions(options);
+    const verifier = newCodeVerifier();
+    const challenge = await codeChallenge(verifier);
+    const redirectTo = type === "magiclink" ? (options.emailRedirectTo ?? "") : "";
+    const body: Record<string, unknown> = {
+      email: options.email.trim(),
+      type,
+      create_user: options.shouldCreateUser ?? true,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    };
+    if (redirectTo !== "") body.redirect_to = redirectTo;
+    await Promise.resolve(this.storage.setItem(this.otpVerifierKey, encodePending({ verifier, redirectTo, startedAt: Date.now() })));
+    try {
+      await this.postJSON(this.host.authEndpoint("/otp"), body);
+    } catch (error) {
+      throw namedOtpError(error);
+    }
+  }
+
+  /**
+   * Spends a code typed by the user, or a link's token hash, with the verifier this browser kept, and signs in.
+   * A wrong code keeps the verifier for another try; a link is spent by its first try.
+   */
+  async verifyOtp(params: VerifyOtpParams): Promise<Session> {
+    const pending = decodePending(await Promise.resolve(this.storage.getItem(this.otpVerifierKey)), Date.now());
+    if (pending == null) {
+      await Promise.resolve(this.storage.removeItem(this.otpVerifierKey));
+      throw new AuthError("No sign-in email was asked for in this browser, or it expired", "pkce_verifier_missing");
+    }
+    const body =
+      params.type === "email"
+        ? { type: "email", email: params.email, token: params.token, code_verifier: pending.verifier }
+        : { type: "magiclink", token_hash: params.token_hash, code_verifier: pending.verifier };
+    let raw: RawAuthResponse;
+    try {
+      raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/verify"), body);
+    } catch (error) {
+      if (params.type === "magiclink") await Promise.resolve(this.storage.removeItem(this.otpVerifierKey));
+      throw namedOtpError(error);
+    }
+    await Promise.resolve(this.storage.removeItem(this.otpVerifierKey));
+    const session = this.sessionFromResponse(raw);
+    this.installSession(session, "SIGNED_IN", { persist: true });
+    return session;
+  }
+
+  /** Only a link this browser asked for, on the page it was sent to, is spent. */
+  private async finishLandedLink(): Promise<void> {
+    const landed = this.location == null ? null : readLandedLink(this.location.href);
+    if (landed == null) return;
+    const pending = decodePending(await Promise.resolve(this.storage.getItem(this.otpVerifierKey)), Date.now());
+    if (pending == null || (pending.redirectTo !== "" && !landedOn(this.location!.href, pending.redirectTo))) return;
+    this.history?.replaceState(null, "", landed.cleaned);
+    await this.verifyOtp({ type: "magiclink", token_hash: landed.tokenHash });
   }
 
   /** Only a sign-in this browser started is finished; any other ?code= is the app's own. */

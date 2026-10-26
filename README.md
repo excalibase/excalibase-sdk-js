@@ -273,6 +273,24 @@ The code is redeemed with a PKCE verifier this browser kept, so a code copied el
 `exchangeCodeForSession(code)` does the same step by hand. A failed sign-in comes back as `?error=<code>`,
 which `hydrate()` raises as an `AuthError` with that code (`signup_disabled`, `email_not_verified`, `access_denied`, ...).
 
+## Sign in with an emailed link or code
+
+The project's Admin turns on "Email links and codes" in Studio. A link lands on the site URL or one of the project's redirect URLs.
+
+```ts
+// A link: the browser comes back to emailRedirectTo?token_hash=...&type=magiclink
+await db.auth.signInWithOtp({ email, emailRedirectTo: "https://app.example.com/auth/callback" });
+const session = await db.auth.hydrate(); // on that page: spends the link and drops it from the address bar
+
+// A six-digit code the user types in
+await db.auth.signInWithOtp({ email, type: "email", shouldCreateUser: false });
+const session = await db.auth.verifyOtp({ type: "email", email, token: "042917" });
+```
+
+`signInWithOtp` resolves the same way whether or not the account exists. The link or code works once, for 10 minutes,
+and only in the browser that asked for it (PKCE). A code allows five tries; a link one. Errors carry the server's code:
+`method_not_enabled`, `rate_limited`, `invalid_or_expired_token`, `signup_disabled`, `account_disabled`.
+
 ## API key management
 
 Authenticated users can mint and revoke API keys for the current project:
