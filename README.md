@@ -282,9 +282,9 @@ The project's Admin turns on "Email links and codes" in Studio. A link lands on 
 await db.auth.signInWithOtp({ email, emailRedirectTo: "https://app.example.com/auth/callback" });
 const session = await db.auth.hydrate(); // on that page: spends the link and drops it from the address bar
 
-// A six-digit code the user types in
+// A eight-digit code the user types in
 await db.auth.signInWithOtp({ email, type: "email", shouldCreateUser: false });
-const session = await db.auth.verifyOtp({ type: "email", email, token: "042917" });
+const session = await db.auth.verifyOtp({ type: "email", email, token: "04291735" });
 ```
 
 `signInWithOtp` resolves the same way whether or not the account exists. The link or code works once, for 10 minutes,

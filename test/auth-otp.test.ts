@@ -96,9 +96,9 @@ describe("AuthClient.verifyOtp", () => {
     const db = createClient({ ...baseOpts, storage, fetch: f });
     const events: string[] = [];
     db.auth.onAuthStateChange((event) => events.push(event));
-    const session = await db.auth.verifyOtp({ email: "ann@app.test", token: "042917", type: "email" });
+    const session = await db.auth.verifyOtp({ email: "ann@app.test", token: "04291735", type: "email" });
     expect(calls[0]!.url).toBe("http://localhost:10010/auth/acme/prod/verify");
-    expect(calls[0]!.body).toEqual({ type: "email", email: "ann@app.test", token: "042917", code_verifier: "w".repeat(43) });
+    expect(calls[0]!.body).toEqual({ type: "email", email: "ann@app.test", token: "04291735", code_verifier: "w".repeat(43) });
     expect(session.user?.email).toBe("ann@app.test");
     expect(db.auth.currentSession()?.accessToken).toBe("jwt-otp");
     expect(storage.getItem(otpKey)).toBeNull();

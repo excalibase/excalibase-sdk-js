@@ -1,6 +1,6 @@
 import { AuthError } from "./errors";
 
-/** `magiclink` mails a link to the app; `email` mails a six-digit code. */
+/** `magiclink` mails a link to the app; `email` mails a eight-digit code. */
 export type EmailOtpType = "magiclink" | "email";
 
 export const EMAIL_OTP_TYPES: readonly EmailOtpType[] = ["magiclink", "email"];

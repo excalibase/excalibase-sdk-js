@@ -178,7 +178,7 @@ export class AuthClient {
   }
 
   /**
-   * Emails a sign-in link or six-digit code. Resolves the same way whether or not the account exists; the
+   * Emails a sign-in link or eight-digit code. Resolves the same way whether or not the account exists; the
    * link or code then works only in this browser, which keeps the PKCE verifier.
    */
   async signInWithOtp(options: SignInWithOtpOptions): Promise<void> {
