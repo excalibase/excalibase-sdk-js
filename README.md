@@ -311,7 +311,8 @@ await db.auth.unlinkIdentity(identities[0]);
 ```
 
 The link is written only when this browser's PKCE verifier redeems the code, so a code or link that leaks links
-nothing. Errors carry the server's code: `identity_already_exists` (on another account, or an address another verified
+nothing. The session a link returns does not count as a fresh sign-in, so linking again needs another sign-in.
+Linked addresses must be plain ASCII, and the mail says it adds the address to an account. Errors carry the server's code: `identity_already_exists` (on another account, or an address another verified
 account uses), `last_sign_in_method` (no other identity and no password would be left), `email_not_verified` (the
 account's own address was never proven), `reauthentication_required`, `method_not_enabled`.
 
