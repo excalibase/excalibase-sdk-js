@@ -234,7 +234,12 @@ export class AuthClient {
     const landed = this.location == null ? null : readLandedLink(this.location.href);
     if (landed == null) return;
     const pending = decodePending(await Promise.resolve(this.storage.getItem(this.otpVerifierKey)), Date.now());
-    if (pending == null || (pending.redirectTo !== "" && !landedOn(this.location!.href, pending.redirectTo))) return;
+    if (pending == null) {
+      // Useless without a verifier this browser never kept; keep it out of history and referrers.
+      this.history?.replaceState(null, "", landed.cleaned);
+      return;
+    }
+    if (pending.redirectTo !== "" && !landedOn(this.location!.href, pending.redirectTo)) return;
     this.history?.replaceState(null, "", landed.cleaned);
     await this.verifyOtp({ type: "magiclink", token_hash: landed.tokenHash });
   }

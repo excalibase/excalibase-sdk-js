@@ -159,7 +159,15 @@ describe("AuthClient.hydrate finishes a magic link that landed on the page", () 
     expect(session?.accessToken).toBe("jwt-otp");
   });
 
-  it("leaves a link alone when this browser asked for none, or on another page", async () => {
+  it("clears a link this browser asked for none of, which it cannot spend anyway", async () => {
+    const { fetch: f, calls } = serverFetch();
+    const { db, replaceState } = landedAt("https://app.test/cb?token_hash=th1&type=magiclink&next=%2Fhome", memoryStorageAdapter(), f);
+    expect(await db.auth.hydrate()).toBeNull();
+    expect(replaceState).toHaveBeenCalledWith(null, "", "https://app.test/cb?next=%2Fhome");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("never spends a link this browser asked for none of, nor one on another page", async () => {
     const { fetch: f, calls } = serverFetch();
     await landedAt("https://app.test/cb?token_hash=th1&type=magiclink", memoryStorageAdapter(), f).db.auth.hydrate();
     const other = memoryStorageAdapter();
