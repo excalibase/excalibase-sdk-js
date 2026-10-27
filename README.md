@@ -306,7 +306,8 @@ await db.auth.linkIdentity({ provider: "github", redirectTo: "https://app.exampl
 ```
 
 A guest has nothing to sign in again with, so the SDK refreshes its session before these calls; a token issued in
-the last few minutes counts as a recent sign-in. Once the address is confirmed or the provider linked, the account is
+the last few minutes counts as a recent sign-in. A guest sets a password only after it has an address
+(`email_required` before). Once the address is confirmed or the provider linked, the account is
 no longer a guest and its role `guest` becomes `user` (a role the project gave it stays). Guests unused for 30 days
 are deleted. Errors carry the server's code: `method_not_enabled`, `signup_disabled`, `rate_limited`,
 `captcha_required`, `captcha_failed`, `captcha_unavailable`.
