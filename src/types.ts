@@ -1,7 +1,10 @@
 export interface User {
   id: number;
+  /** Empty for a guest, which has no address until it adds one. */
   email: string;
   fullName: string;
+  /** True for a guest account made by `signInAsGuest`. */
+  isGuest?: boolean;
 }
 
 export interface Session {

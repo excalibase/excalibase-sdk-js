@@ -291,6 +291,26 @@ const session = await db.auth.verifyOtp({ type: "email", email, token: "04291735
 and only in the browser that asked for it (PKCE). A code allows five tries; a link one. Errors carry the server's code:
 `method_not_enabled`, `rate_limited`, `invalid_or_expired_token`, `signup_disabled`, `account_disabled`.
 
+## Guest accounts
+
+When the project turns guests on, an app can start a session without asking for anything. The account has no
+address or password and runs as the role `guest`, which reaches nothing until the project gives it permissions.
+
+```ts
+const session = await db.auth.signInAsGuest(); // or { captchaToken } when the project requires Turnstile
+db.auth.user()?.isGuest; // true
+
+// Later the same account, same id, takes an address or a provider
+await db.auth.updateUser({ email: "me@example.com" }, { emailRedirectTo: "https://app.example.com/settings" });
+await db.auth.linkIdentity({ provider: "github", redirectTo: "https://app.example.com/settings" });
+```
+
+A guest has nothing to sign in again with, so the SDK refreshes its session before these calls; a token issued in
+the last few minutes counts as a recent sign-in. Once the address is confirmed or the provider linked, the account is
+no longer a guest and its role `guest` becomes `user` (a role the project gave it stays). Guests unused for 30 days
+are deleted. Errors carry the server's code: `method_not_enabled`, `signup_disabled`, `rate_limited`,
+`captcha_required`, `captcha_failed`, `captcha_unavailable`.
+
 ## Link identities to the signed-in account
 
 A signed-in user adds Google, GitHub or another address to the one account, then signs in with any of them.
