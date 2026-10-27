@@ -1,4 +1,5 @@
-import { AuthError, CorsError, NetworkError } from "./errors";
+import { AuthHttp } from "./auth-http";
+import { AuthError } from "./errors";
 import {
   codeChallenge,
   decodePending,
@@ -25,11 +26,26 @@ import {
   type EmailOtpType,
   namedOtpError,
   readLandedLink,
+  readLandedTokenHash,
   type SignInWithOtpOptions,
   validateOtpOptions,
   type VerifyOtpParams,
 } from "./otp";
 import type { StorageAdapter } from "./storage";
+import {
+  type ConfirmEmailChangeResult,
+  namedUserError,
+  type RawUpdateUserResponse,
+  type SignOutOptions,
+  type SignOutScope,
+  type UpdateUserOptions,
+  type UpdateUserResult,
+  updateUserBody,
+  type UserAttributes,
+  type UserProfile,
+  validateScope,
+  type VerifyEmailChangeParams,
+} from "./user";
 import { computeExpiresAt, TokenManager } from "./token-manager";
 import type {
   APIKeyInfo,
@@ -89,7 +105,7 @@ export class AuthClient {
   private readonly host: AuthClientHost;
   private readonly storage: StorageAdapter;
   private readonly storageKey: string;
-  private readonly fetchImpl: typeof fetch;
+  private readonly http: AuthHttp;
   private readonly listeners = new Set<AuthChangeHandler>();
   private readonly tokenManager: TokenManager;
   private session: Session | null = null;
@@ -102,7 +118,11 @@ export class AuthClient {
     this.host = opts.client;
     this.storage = opts.storage;
     this.storageKey = opts.storageKey;
-    this.fetchImpl = opts.fetch;
+    this.http = new AuthHttp({
+      fetch: opts.fetch,
+      publishableKey: () => this.host.publishableKey,
+      accessToken: () => this.session?.accessToken ?? null,
+    });
     this.detectSessionInUrl = opts.detectSessionInUrl ?? true;
     this.location = opts.location;
     this.history = opts.history;
@@ -143,6 +163,7 @@ export class AuthClient {
     if (this.detectSessionInUrl) {
       await this.finishLandedSignIn();
       await this.finishLandedLink();
+      await this.finishLandedEmailChange();
     }
     return this.session;
   }
@@ -180,7 +201,7 @@ export class AuthClient {
     const body = { grant_type: "pkce", auth_code: code, code_verifier: pending.verifier };
     let raw: RawAuthResponse;
     try {
-      raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/token"), body);
+      raw = await this.http.post<RawAuthResponse>(this.host.authEndpoint("/token"), body);
     } catch (error) {
       throw namedLinkError(error);
     }
@@ -229,7 +250,7 @@ export class AuthClient {
     };
     if (redirectTo !== "") body.redirect_to = redirectTo;
     await Promise.resolve(this.storage.setItem(this.otpVerifierKey, encodePending({ verifier, redirectTo, startedAt: Date.now() })));
-    await this.postJSON(this.host.authEndpoint(path), body);
+    await this.http.post(this.host.authEndpoint(path), body);
   }
 
   /**
@@ -244,7 +265,7 @@ export class AuthClient {
     const challenge = await codeChallenge(verifier);
     let ticket: LinkTicket;
     try {
-      ticket = await this.postJSON<LinkTicket>(this.host.authEndpoint("/user/identities/authorize"), {
+      ticket = await this.http.post<LinkTicket>(this.host.authEndpoint("/user/identities/authorize"), {
         provider: options.provider,
         redirect_to: options.redirectTo,
         code_challenge: challenge,
@@ -280,7 +301,7 @@ export class AuthClient {
   async getUserIdentities(): Promise<UserIdentities> {
     this.requireSession();
     try {
-      return await this.getJSON<UserIdentities>(this.host.authEndpoint("/user/identities"));
+      return await this.http.get<UserIdentities>(this.host.authEndpoint("/user/identities"));
     } catch (error) {
       throw namedLinkError(error);
     }
@@ -291,23 +312,27 @@ export class AuthClient {
     this.requireSession();
     const id = typeof identity === "number" ? identity : identity.id;
     try {
-      await this.deleteJSON(this.host.authEndpoint(`/user/identities/${encodeURIComponent(String(id))}`));
+      await this.http.delete(this.host.authEndpoint(`/user/identities/${encodeURIComponent(String(id))}`));
     } catch (error) {
       throw namedLinkError(error);
     }
   }
 
-  private requireSession(): void {
+  private requireSession(): Session {
     if (this.session?.accessToken == null) {
       throw new AuthError("Sign in first", "not_signed_in");
     }
+    return this.session;
   }
 
   /**
    * Spends a code typed by the user, or a link's token hash, with the verifier this browser kept, and signs in.
    * A wrong code keeps the verifier for another try; a link is spent by its first try.
    */
-  async verifyOtp(params: VerifyOtpParams): Promise<Session> {
+  async verifyOtp(params: VerifyEmailChangeParams): Promise<ConfirmEmailChangeResult>;
+  async verifyOtp(params: VerifyOtpParams): Promise<Session>;
+  async verifyOtp(params: VerifyOtpParams | VerifyEmailChangeParams): Promise<Session | ConfirmEmailChangeResult> {
+    if (params.type === "email_change") return this.confirmEmailChange({ tokenHash: params.token_hash });
     const pending = decodePending(await Promise.resolve(this.storage.getItem(this.otpVerifierKey)), Date.now());
     if (pending == null) {
       await Promise.resolve(this.storage.removeItem(this.otpVerifierKey));
@@ -319,7 +344,7 @@ export class AuthClient {
         : { type: "magiclink", token_hash: params.token_hash, code_verifier: pending.verifier };
     let raw: RawAuthResponse;
     try {
-      raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/verify"), body);
+      raw = await this.http.post<RawAuthResponse>(this.host.authEndpoint("/verify"), body);
     } catch (error) {
       if (params.type === "magiclink") await Promise.resolve(this.storage.removeItem(this.otpVerifierKey));
       throw namedLinkError(namedOtpError(error));
@@ -343,6 +368,14 @@ export class AuthClient {
     if (pending.redirectTo !== "" && !landedOn(this.location!.href, pending.redirectTo)) return;
     this.history?.replaceState(null, "", landed.cleaned);
     await this.verifyOtp({ type: "magiclink", token_hash: landed.tokenHash });
+  }
+
+  /** The link proves the new inbox by itself, so it needs no verifier and is confirmed on whatever page it lands. */
+  private async finishLandedEmailChange(): Promise<void> {
+    const landed = this.location == null ? null : readLandedTokenHash(this.location.href, "email_change");
+    if (landed == null) return;
+    this.history?.replaceState(null, "", landed.cleaned);
+    await this.confirmEmailChange({ tokenHash: landed.tokenHash });
   }
 
   /** Only a sign-in this browser started is finished; any other ?code= is the app's own. */
@@ -382,7 +415,7 @@ export class AuthClient {
       password: credentials.password,
       fullName: credentials.fullName,
     };
-    const raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/register"), body);
+    const raw = await this.http.post<RawAuthResponse>(this.host.authEndpoint("/register"), body);
     const session = this.sessionFromResponse(raw);
     this.installSession(session, "SIGNED_IN", { persist: true });
     return session;
@@ -394,7 +427,7 @@ export class AuthClient {
       email: credentials.email,
       password: credentials.password,
     };
-    const raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/token"), body);
+    const raw = await this.http.post<RawAuthResponse>(this.host.authEndpoint("/token"), body);
     const session = this.sessionFromResponse(raw);
     this.installSession(session, "SIGNED_IN", { persist: true });
     return session;
@@ -403,23 +436,91 @@ export class AuthClient {
   async signInWithApiKey(apiKey?: string): Promise<Session> {
     const key = apiKey ?? this.host.publishableKey;
     const body = { grant_type: "api_key", api_key: key };
-    const raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/token"), body);
+    const raw = await this.http.post<RawAuthResponse>(this.host.authEndpoint("/token"), body);
     const session = this.sessionFromResponse(raw);
     this.installSession(session, "SIGNED_IN", { persist: true });
     return session;
   }
 
-  async signOut(): Promise<void> {
+  /**
+   * `local` (the default) revokes this session's refresh token, ignoring a failure, and clears it here. `global`
+   * ends every session of the user and clears this one even when the server refuses, then rethrows. `others`
+   * ends every other session and keeps this one.
+   */
+  async signOut(options: SignOutOptions = {}): Promise<void> {
+    const scope = validateScope(options.scope ?? "local");
+    if (scope !== "local") return this.signOutEverywhere(scope);
     const refreshToken = this.session?.refreshToken;
     if (refreshToken != null && refreshToken.length > 0) {
       try {
-        await this.postJSON(this.host.authEndpoint("/logout"), { refreshToken });
+        await this.http.post(this.host.authEndpoint("/logout"), { refreshToken });
       } catch {
         // Swallow logout errors — the local session is removed regardless,
         // and the refresh token will be cleaned up server-side on expiry.
       }
     }
     this.installSession(null, "SIGNED_OUT", { persist: true });
+  }
+
+  private async signOutEverywhere(scope: Exclude<SignOutScope, "local">): Promise<void> {
+    this.requireSession();
+    const url = `${this.host.authEndpoint("/logout")}?scope=${scope}`;
+    try {
+      await this.http.post(url, { refreshToken: this.session?.refreshToken ?? null });
+    } catch (error) {
+      throw namedUserError(error);
+    } finally {
+      if (scope === "global") this.installSession(null, "SIGNED_OUT", { persist: true });
+    }
+  }
+
+  /** The signed-in account, with its metadata. */
+  async getUser(): Promise<UserProfile> {
+    this.requireSession();
+    try {
+      return await this.http.get<UserProfile>(this.host.authEndpoint("/user"));
+    } catch (error) {
+      throw namedUserError(error);
+    }
+  }
+
+  /**
+   * Changes the signed-in account. A password or address change needs a sign-in in the last 5 minutes (or, for a
+   * password, `currentPassword`); app metadata is written only by a secret key or Studio.
+   */
+  async updateUser(attributes: UserAttributes, options: UpdateUserOptions = {}): Promise<UpdateUserResult> {
+    const body = updateUserBody(attributes, options);
+    this.requireSession();
+    let raw: RawUpdateUserResponse;
+    try {
+      raw = await this.http.request<RawUpdateUserResponse>("PATCH", this.host.authEndpoint("/user"), body);
+    } catch (error) {
+      throw namedUserError(error);
+    }
+    if (raw.session != null) {
+      this.installSession(this.sessionFromResponse(raw.session), "TOKEN_REFRESHED", { persist: true });
+    } else if (this.session != null) {
+      const { id, email, fullName } = raw.user;
+      this.installSession({ ...this.session, user: { id, email, fullName } }, "USER_UPDATED", { persist: true });
+    }
+    return { user: raw.user, emailChangeRequested: raw.emailChangeRequested === true };
+  }
+
+  /**
+   * Confirms a new address with the link's token hash. A signed-in session is refreshed so the new address shows.
+   */
+  async confirmEmailChange(input: { tokenHash: string }): Promise<ConfirmEmailChangeResult> {
+    requireValue(input.tokenHash, "tokenHash is required");
+    try {
+      await this.http.post(this.host.authEndpoint("/user/email/confirm"), { token_hash: input.tokenHash });
+    } catch (error) {
+      throw namedUserError(error);
+    }
+    if (this.session?.user == null) return { user: null };
+    const refreshed = await this.refresh();
+    if (refreshed == null) return { user: null };
+    this.installSession(refreshed, "USER_UPDATED", { persist: true });
+    return { user: refreshed.user };
   }
 
   /**
@@ -431,14 +532,14 @@ export class AuthClient {
     const refreshToken = this.session?.refreshToken;
     if (refreshToken != null && refreshToken.length > 0) {
       const body = { grant_type: "refresh_token", refresh_token: refreshToken };
-      const raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/token"), body);
+      const raw = await this.http.post<RawAuthResponse>(this.host.authEndpoint("/token"), body);
       return this.sessionFromResponse(raw);
     }
     // No refresh token — this path handles the api-key flow (no refresh
     // tokens issued) and the anonymous-publishable-key bootstrap.
     if (this.host.publishableKey.startsWith("esk_")) {
       const body = { grant_type: "api_key", api_key: this.host.publishableKey };
-      const raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/token"), body);
+      const raw = await this.http.post<RawAuthResponse>(this.host.authEndpoint("/token"), body);
       return this.sessionFromResponse(raw);
     }
     return null;
@@ -447,7 +548,7 @@ export class AuthClient {
   /** Redeems the token from a verification email. The server ends every session the account had. */
   async verifyEmail(input: { token: string }): Promise<VerifyEmailResult> {
     requireValue(input.token, "token is required");
-    const raw = await this.postJSON<{ verified?: boolean; passwordResetRequired?: boolean }>(
+    const raw = await this.http.post<{ verified?: boolean; passwordResetRequired?: boolean }>(
       this.host.authEndpoint("/verify-email"),
       { token: input.token },
     );
@@ -457,36 +558,36 @@ export class AuthClient {
   /** Asks for a new verification email. Resolves the same way whether or not the account exists. */
   async resendVerification(input: { email: string }): Promise<void> {
     requireValue(input.email, "email is required");
-    await this.postJSON(this.host.authEndpoint("/resend-verification"), { email: input.email });
+    await this.http.post(this.host.authEndpoint("/resend-verification"), { email: input.email });
   }
 
   /** Asks for a password reset email. Resolves the same way whether or not the account exists. */
   async resetPasswordForEmail(email: string): Promise<void> {
     requireValue(email, "email is required");
-    await this.postJSON(this.host.authEndpoint("/forgot-password"), { email });
+    await this.http.post(this.host.authEndpoint("/forgot-password"), { email });
   }
 
   /** Sets a new password with the token from a reset email. The server ends every session the account had. */
   async updatePasswordWithToken(input: UpdatePasswordWithTokenInput): Promise<void> {
     requireValue(input.token, "token is required");
     requireValue(input.password, "password is required");
-    await this.postJSON(this.host.authEndpoint("/reset-password"), {
+    await this.http.post(this.host.authEndpoint("/reset-password"), {
       token: input.token,
       newPassword: input.password,
     });
   }
 
   async createApiKey(input: { name: string; keyType: "publishable" | "secret" }): Promise<CreateAPIKeyResult> {
-    return this.postJSON<CreateAPIKeyResult>(this.host.authEndpoint("/api-keys/"), input);
+    return this.http.post<CreateAPIKeyResult>(this.host.authEndpoint("/api-keys/"), input);
   }
 
   async listApiKeys(): Promise<APIKeyInfo[]> {
-    const response = await this.getJSON<{ keys: APIKeyInfo[] }>(this.host.authEndpoint("/api-keys/"));
+    const response = await this.http.get<{ keys: APIKeyInfo[] }>(this.host.authEndpoint("/api-keys/"));
     return response.keys ?? [];
   }
 
   async revokeApiKey(id: number): Promise<void> {
-    await this.deleteJSON(this.host.authEndpoint(`/api-keys/${id}`));
+    await this.http.delete(this.host.authEndpoint(`/api-keys/${id}`));
   }
 
   stopAutoRefresh(): void {
@@ -533,73 +634,12 @@ export class AuthClient {
       // Storage failures shouldn't crash the caller — session is still in memory.
     }
   }
-
-  private baseHeaders(): Record<string, string> {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      "X-Excalibase-Publishable-Key": this.host.publishableKey,
-    };
-    if (this.session?.accessToken != null) {
-      headers["Authorization"] = `Bearer ${this.session.accessToken}`;
-    }
-    return headers;
-  }
-
-  private async postJSON<T>(url: string, body: unknown): Promise<T> {
-    return this.requestJSON<T>("POST", url, body);
-  }
-
-  private async getJSON<T>(url: string): Promise<T> {
-    return this.requestJSON<T>("GET", url);
-  }
-
-  private async deleteJSON<T>(url: string): Promise<T> {
-    return this.requestJSON<T>("DELETE", url);
-  }
-
-  private async requestJSON<T>(method: string, url: string, body?: unknown): Promise<T> {
-    let response: Response;
-    try {
-      response = await this.fetchImpl(url, {
-        method,
-        headers: this.baseHeaders(),
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-    } catch (error) {
-      if (error instanceof CorsError) throw error;
-      throw new NetworkError(`Auth request failed: ${method} ${url}`, error);
-    }
-    const text = await response.text();
-    const parsed = text.length > 0 ? parseJson(text) : null;
-    if (!response.ok) {
-      const message = extractErrorMessage(parsed) ?? `Auth ${method} ${url} failed with ${response.status}`;
-      throw new AuthError(message, `http_${response.status}`, response.status, parsed);
-    }
-    return (parsed ?? ({} as T)) as T;
-  }
 }
 
 function requireValue(value: string | undefined, message: string): void {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new AuthError(message, "invalid_request");
   }
-}
-
-function parseJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
-}
-
-function extractErrorMessage(parsed: unknown): string | null {
-  if (parsed != null && typeof parsed === "object") {
-    const obj = parsed as Record<string, unknown>;
-    if (typeof obj.error === "string") return obj.error;
-    if (typeof obj.message === "string") return obj.message;
-  }
-  return null;
 }
 
 /**
