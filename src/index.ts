@@ -7,6 +7,7 @@ export type { DatabaseShape, AnyDatabase, RowOf } from "./client";
 export { AuthClient } from "./auth";
 export type { HistoryLike, LocationLike, OAuthProvider, OAuthRedirect, SignInWithOAuthOptions } from "./oauth";
 export type { EmailOtpType, SignInWithOtpOptions, VerifyOtpParams } from "./otp";
+export type { LinkEmailOptions, LinkIdentityOptions, UserIdentities, UserIdentity } from "./identities";
 export { GraphqlNamespace } from "./graphql-ns";
 export { RestNamespace } from "./rest-ns";
 export { QueryBuilder, str, unquoted } from "./query-builder";

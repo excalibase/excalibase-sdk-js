@@ -13,7 +13,22 @@ import {
   type SignInWithOAuthOptions,
   validateOAuthOptions,
 } from "./oauth";
-import { namedOtpError, readLandedLink, type SignInWithOtpOptions, validateOtpOptions, type VerifyOtpParams } from "./otp";
+import {
+  type LinkEmailOptions,
+  type LinkIdentityOptions,
+  type LinkTicket,
+  namedLinkError,
+  type UserIdentities,
+  type UserIdentity,
+} from "./identities";
+import {
+  type EmailOtpType,
+  namedOtpError,
+  readLandedLink,
+  type SignInWithOtpOptions,
+  validateOtpOptions,
+  type VerifyOtpParams,
+} from "./otp";
 import type { StorageAdapter } from "./storage";
 import { computeExpiresAt, TokenManager } from "./token-manager";
 import type {
@@ -163,7 +178,12 @@ export class AuthClient {
       throw new AuthError("No sign-in was started in this browser, or it expired", "pkce_verifier_missing");
     }
     const body = { grant_type: "pkce", auth_code: code, code_verifier: pending.verifier };
-    const raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/token"), body);
+    let raw: RawAuthResponse;
+    try {
+      raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/token"), body);
+    } catch (error) {
+      throw namedLinkError(error);
+    }
     const session = this.sessionFromResponse(raw);
     this.installSession(session, "SIGNED_IN", { persist: true });
     return session;
@@ -183,22 +203,103 @@ export class AuthClient {
    */
   async signInWithOtp(options: SignInWithOtpOptions): Promise<void> {
     const type = validateOtpOptions(options);
+    try {
+      await this.requestEmail("/otp", options, type, { create_user: options.shouldCreateUser ?? true });
+    } catch (error) {
+      throw namedOtpError(error);
+    }
+  }
+
+  /** Keeps a PKCE verifier for /verify and asks auth to mail a link or code. */
+  private async requestEmail(
+    path: string,
+    options: { email: string; emailRedirectTo?: string },
+    type: EmailOtpType,
+    extra: Record<string, unknown>,
+  ): Promise<void> {
     const verifier = newCodeVerifier();
     const challenge = await codeChallenge(verifier);
     const redirectTo = type === "magiclink" ? (options.emailRedirectTo ?? "") : "";
     const body: Record<string, unknown> = {
       email: options.email.trim(),
       type,
-      create_user: options.shouldCreateUser ?? true,
+      ...extra,
       code_challenge: challenge,
       code_challenge_method: "S256",
     };
     if (redirectTo !== "") body.redirect_to = redirectTo;
     await Promise.resolve(this.storage.setItem(this.otpVerifierKey, encodePending({ verifier, redirectTo, startedAt: Date.now() })));
+    await this.postJSON(this.host.authEndpoint(path), body);
+  }
+
+  /**
+   * Links Google or GitHub to the signed-in account. The browser goes through the provider and lands on
+   * `redirectTo?code=…`; the link is written when `hydrate()` or `exchangeCodeForSession` redeems that code with
+   * the verifier kept here. Needs a recent sign-in (`reauthentication_required` otherwise).
+   */
+  async linkIdentity(options: LinkIdentityOptions): Promise<OAuthRedirect> {
+    validateOAuthOptions(options);
+    this.requireSession();
+    const verifier = newCodeVerifier();
+    const challenge = await codeChallenge(verifier);
+    let ticket: LinkTicket;
     try {
-      await this.postJSON(this.host.authEndpoint("/otp"), body);
+      ticket = await this.postJSON<LinkTicket>(this.host.authEndpoint("/user/identities/authorize"), {
+        provider: options.provider,
+        redirect_to: options.redirectTo,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+      });
     } catch (error) {
-      throw namedOtpError(error);
+      throw namedLinkError(error);
+    }
+    const pending = encodePending({ verifier, redirectTo: options.redirectTo, startedAt: Date.now() });
+    await Promise.resolve(this.storage.setItem(this.verifierKey, pending));
+    const url = `${this.host.authEndpoint("/authorize")}?${new URLSearchParams({ link_ticket: ticket.linkTicket }).toString()}`;
+    if (options.skipBrowserRedirect !== true) {
+      this.location?.assign(url);
+    }
+    return { provider: options.provider, url };
+  }
+
+  /**
+   * Emails a link or code proving another address; `verifyOtp` (or `hydrate()` for a link) spends it in this
+   * browser and links the address to the signed-in account. Needs a recent sign-in.
+   */
+  async linkEmail(options: LinkEmailOptions): Promise<void> {
+    const type = validateOtpOptions(options);
+    this.requireSession();
+    try {
+      await this.requestEmail("/user/identities/email", options, type, {});
+    } catch (error) {
+      throw namedLinkError(error);
+    }
+  }
+
+  /** The signed-in account's linked identities, and whether it has a password. */
+  async getUserIdentities(): Promise<UserIdentities> {
+    this.requireSession();
+    try {
+      return await this.getJSON<UserIdentities>(this.host.authEndpoint("/user/identities"));
+    } catch (error) {
+      throw namedLinkError(error);
+    }
+  }
+
+  /** Unlinks an identity; refused (`last_sign_in_method`) when it is the last way in. Needs a recent sign-in. */
+  async unlinkIdentity(identity: UserIdentity | number): Promise<void> {
+    this.requireSession();
+    const id = typeof identity === "number" ? identity : identity.id;
+    try {
+      await this.deleteJSON(this.host.authEndpoint(`/user/identities/${encodeURIComponent(String(id))}`));
+    } catch (error) {
+      throw namedLinkError(error);
+    }
+  }
+
+  private requireSession(): void {
+    if (this.session?.accessToken == null) {
+      throw new AuthError("Sign in first", "not_signed_in");
     }
   }
 
@@ -221,7 +322,7 @@ export class AuthClient {
       raw = await this.postJSON<RawAuthResponse>(this.host.authEndpoint("/verify"), body);
     } catch (error) {
       if (params.type === "magiclink") await Promise.resolve(this.storage.removeItem(this.otpVerifierKey));
-      throw namedOtpError(error);
+      throw namedLinkError(namedOtpError(error));
     }
     await Promise.resolve(this.storage.removeItem(this.otpVerifierKey));
     const session = this.sessionFromResponse(raw);

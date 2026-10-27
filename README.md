@@ -291,6 +291,31 @@ const session = await db.auth.verifyOtp({ type: "email", email, token: "04291735
 and only in the browser that asked for it (PKCE). A code allows five tries; a link one. Errors carry the server's code:
 `method_not_enabled`, `rate_limited`, `invalid_or_expired_token`, `signup_disabled`, `account_disabled`.
 
+## Link identities to the signed-in account
+
+A signed-in user adds Google, GitHub or another address to the one account, then signs in with any of them.
+Linking and unlinking need a sign-in in the last 5 minutes; an older session gets `reauthentication_required`,
+so sign the user in again first.
+
+```ts
+// Google or GitHub: the browser goes through the provider and comes back to redirectTo?code=...
+await db.auth.linkIdentity({ provider: "google", redirectTo: "https://app.example.com/settings" });
+const session = await db.auth.hydrate(); // on that page: writes the link and starts a fresh session
+
+// Another address, proven by an emailed code (or a link, which hydrate() spends)
+await db.auth.linkEmail({ email: "me@work.example", type: "email" });
+await db.auth.verifyOtp({ type: "email", email: "me@work.example", token: "04291735" });
+
+const { identities, hasPassword } = await db.auth.getUserIdentities();
+await db.auth.unlinkIdentity(identities[0]);
+```
+
+The link is written only when this browser's PKCE verifier redeems the code, so a code or link that leaks links
+nothing. The session a link returns does not count as a fresh sign-in, so linking again needs another sign-in.
+Linked addresses must be plain ASCII, and the mail says it adds the address to an account. Errors carry the server's code: `identity_already_exists` (on another account, or an address another verified
+account uses), `last_sign_in_method` (no other identity and no password would be left), `email_not_verified` (the
+account's own address was never proven), `reauthentication_required`, `method_not_enabled`.
+
 ## API key management
 
 Authenticated users can mint and revoke API keys for the current project:
