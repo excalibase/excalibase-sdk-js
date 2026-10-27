@@ -24,9 +24,11 @@ export type AuthChangeEvent =
   | "SIGNED_IN"
   | "SIGNED_OUT"
   | "TOKEN_REFRESHED"
-  | "USER_UPDATED";
+  | "USER_UPDATED"
+  /** An email change link that landed on the page was refused; the error is the handler's third argument. */
+  | "EMAIL_CHANGE_FAILED";
 
-export type AuthChangeHandler = (event: AuthChangeEvent, session: Session | null) => void;
+export type AuthChangeHandler = (event: AuthChangeEvent, session: Session | null, error?: unknown) => void;
 
 export interface Subscription {
   unsubscribe: () => void;

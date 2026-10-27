@@ -19,7 +19,10 @@ export interface UserAttributes {
    * removed. At most 16 KB as compact JSON and 8 levels deep.
    */
   data?: Record<string, unknown>;
-  /** Mails a confirmation link to the new address; the address changes only when it is confirmed. */
+  /**
+   * Mails a confirmation link to the new address; the address changes only when it is confirmed. Not together
+   * with `password` (`password_and_email_separately`).
+   */
   email?: string;
   /** Ends every session of the account; the fresh one returned becomes the current session. */
   password?: string;
@@ -58,7 +61,7 @@ export interface VerifyEmailChangeParams {
 }
 
 export interface ConfirmEmailChangeResult {
-  /** The refreshed session's user, or null when this browser was not signed in. */
+  /** The refreshed session's user, or null when the session has no refresh token to refresh with. */
   user: User | null;
 }
 
@@ -78,6 +81,9 @@ export function updateUserBody(attributes: UserAttributes, options: UpdateUserOp
   const unknown = Object.keys(attributes).filter((key) => !ATTRIBUTE_KEYS.includes(key as keyof UserAttributes));
   if (unknown.length > 0) {
     throw new AuthError(`updateUser does not take ${unknown.join(", ")}`, "invalid_request");
+  }
+  if (attributes.email !== undefined && attributes.password !== undefined) {
+    throw new AuthError("Change the password and the email address in separate requests", "password_and_email_separately");
   }
   if (attributes.data !== undefined && !isPlainObject(attributes.data)) {
     throw new AuthError("data must be an object", "invalid_metadata");
@@ -105,6 +111,7 @@ const USER_ERRORS = new Set([
   "email_exists",
   "method_not_enabled",
   "invalid_scope",
+  "password_and_email_separately",
   "invalid_request",
   "account_disabled",
 ]);

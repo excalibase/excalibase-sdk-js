@@ -370,12 +370,19 @@ export class AuthClient {
     await this.verifyOtp({ type: "magiclink", token_hash: landed.tokenHash });
   }
 
-  /** The link proves the new inbox by itself, so it needs no verifier and is confirmed on whatever page it lands. */
+  /**
+   * Confirmed only for a signed-in browser; otherwise the link stays on the page for the app to confirm after
+   * sign-in. A refusal is reported as EMAIL_CHANGE_FAILED, never thrown, so a crafted link cannot break start-up.
+   */
   private async finishLandedEmailChange(): Promise<void> {
     const landed = this.location == null ? null : readLandedTokenHash(this.location.href, "email_change");
-    if (landed == null) return;
+    if (landed == null || this.session?.accessToken == null) return;
     this.history?.replaceState(null, "", landed.cleaned);
-    await this.confirmEmailChange({ tokenHash: landed.tokenHash });
+    try {
+      await this.confirmEmailChange({ tokenHash: landed.tokenHash });
+    } catch (error) {
+      this.emit("EMAIL_CHANGE_FAILED", this.session, error);
+    }
   }
 
   /** Only a sign-in this browser started is finished; any other ?code= is the app's own. */
@@ -465,12 +472,24 @@ export class AuthClient {
   private async signOutEverywhere(scope: Exclude<SignOutScope, "local">): Promise<void> {
     this.requireSession();
     const url = `${this.host.authEndpoint("/logout")}?scope=${scope}`;
+    const refreshToken = this.session?.refreshToken ?? null;
     try {
-      await this.http.post(url, { refreshToken: this.session?.refreshToken ?? null });
+      await this.http.post(url, { refreshToken });
     } catch (error) {
+      if (scope === "global") await this.revokeQuietly(refreshToken);
       throw namedUserError(error);
     } finally {
       if (scope === "global") this.installSession(null, "SIGNED_OUT", { persist: true });
+    }
+  }
+
+  /** Revokes this session's refresh token; a failure is ignored since the session is cleared regardless. */
+  private async revokeQuietly(refreshToken: string | null): Promise<void> {
+    if (refreshToken == null || refreshToken.length === 0) return;
+    try {
+      await this.http.post(this.host.authEndpoint("/logout"), { refreshToken });
+    } catch {
+      // The token still expires server-side.
     }
   }
 
@@ -507,16 +526,17 @@ export class AuthClient {
   }
 
   /**
-   * Confirms a new address with the link's token hash. A signed-in session is refreshed so the new address shows.
+   * Confirms a new address with the link's token hash. Needs the session of the account that asked for the change;
+   * it is refreshed afterwards so the new address shows.
    */
   async confirmEmailChange(input: { tokenHash: string }): Promise<ConfirmEmailChangeResult> {
     requireValue(input.tokenHash, "tokenHash is required");
+    this.requireSession();
     try {
       await this.http.post(this.host.authEndpoint("/user/email/confirm"), { token_hash: input.tokenHash });
     } catch (error) {
       throw namedUserError(error);
     }
-    if (this.session?.user == null) return { user: null };
     const refreshed = await this.refresh();
     if (refreshed == null) return { user: null };
     this.installSession(refreshed, "USER_UPDATED", { persist: true });
@@ -614,9 +634,14 @@ export class AuthClient {
     if (opts.persist) {
       void this.persistSession(session);
     }
+    this.emit(event, session);
+  }
+
+  private emit(event: AuthChangeEvent, session: Session | null, error?: unknown): void {
     for (const listener of this.listeners) {
       try {
-        listener(event, session);
+        if (error === undefined) listener(event, session);
+        else listener(event, session, error);
       } catch {
         // Listener failures must not break the auth flow.
       }

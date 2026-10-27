@@ -65,10 +65,14 @@ async function client(fetchImpl: typeof fetch, storage = memoryStorageAdapter())
   const db = createClient({ ...baseOpts, storage, fetch: fetchImpl });
   await db.auth.hydrate();
   const events: AuthChangeEvent[] = [];
-  db.auth.onAuthStateChange((event) => events.push(event));
+  const errors: unknown[] = [];
+  db.auth.onAuthStateChange((event, _session, error) => {
+    events.push(event);
+    if (error !== undefined) errors.push(error);
+  });
   await Promise.resolve();
   events.length = 0;
-  return { db, storage, events };
+  return { db, storage, events, errors };
 }
 
 function flush(): Promise<void> {
@@ -144,6 +148,9 @@ describe("AuthClient.updateUser", () => {
     });
     await expect(db.auth.updateUser({ data: ["a"] } as never)).rejects.toMatchObject({ code: "invalid_metadata" });
     await expect(db.auth.updateUser({ data: null } as never)).rejects.toMatchObject({ code: "invalid_metadata" });
+    await expect(db.auth.updateUser({ email: "new@app.test", password: "new-secret" })).rejects.toMatchObject({
+      code: "password_and_email_separately",
+    });
     expect(calls).toHaveLength(0);
   });
 
@@ -154,6 +161,7 @@ describe("AuthClient.updateUser", () => {
     [400, "metadata_too_large"],
     [429, "rate_limited"],
     [404, "method_not_enabled"],
+    [400, "password_and_email_separately"],
   ])("names a %i %s refusal by its code", async (status, error) => {
     const { fetch: f } = server(() => ({ status, body: { error, status } }));
     const { db } = await client(f);
@@ -191,10 +199,23 @@ describe("AuthClient.signOut scopes", () => {
     expect(events).toEqual(["SIGNED_OUT"]);
   });
 
-  it("global clears this session even when the server refuses, then names the refusal", async () => {
-    const { fetch: f } = server(() => ({ status: 404, body: { error: "method_not_enabled" } }));
+  it("global falls back to revoking this refresh token when refused, clears this session, then names the refusal", async () => {
+    const { fetch: f, calls } = server((call) =>
+      call.url.endsWith("?scope=global") ? { status: 404, body: { error: "method_not_enabled" } } : { body: {} },
+    );
     const { db } = await client(f);
     await expect(db.auth.signOut({ scope: "global" })).rejects.toMatchObject({ code: "method_not_enabled" });
+    expect(calls[1]).toMatchObject({ method: "POST", url: `${authUrl}/logout`, body: { refreshToken: "rt" } });
+    expect(db.auth.currentSession()).toBeNull();
+  });
+
+  it("global still clears this session and names the first refusal when the fallback fails too", async () => {
+    const { fetch: f, calls } = server((call) =>
+      call.url.endsWith("?scope=global") ? { status: 404, body: { error: "method_not_enabled" } } : { status: 500, body: { error: "boom" } },
+    );
+    const { db } = await client(f);
+    await expect(db.auth.signOut({ scope: "global" })).rejects.toMatchObject({ code: "method_not_enabled" });
+    expect(calls).toHaveLength(2);
     expect(db.auth.currentSession()).toBeNull();
   });
 
@@ -241,22 +262,44 @@ describe("AuthClient email change confirmation", () => {
     );
   }
 
-  it("confirms without a verifier or session and returns no user", async () => {
-    const { fetch: f, calls } = confirming();
-    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
-    await expect(db.auth.confirmEmailChange({ tokenHash: "th1" })).resolves.toEqual({ user: null });
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ method: "POST", url: `${authUrl}/user/email/confirm`, body: { token_hash: "th1" } });
-  });
+  function landedAt(href: string, f: typeof fetch, storage = memoryStorageAdapter()) {
+    const replaceState = jest.fn();
+    const db = createClient({ ...baseOpts, storage, fetch: f, location: { href, assign: jest.fn() }, history: { replaceState } });
+    const events: AuthChangeEvent[] = [];
+    const errors: unknown[] = [];
+    db.auth.onAuthStateChange((event, _session, error) => {
+      events.push(event);
+      if (error !== undefined) errors.push(error);
+    });
+    return { db, replaceState, events, errors };
+  }
 
-  it("refreshes a signed-in session so the new address shows", async () => {
+  const landedHref = "https://app.test/settings?token_hash=th1&type=email_change&tab=account";
+
+  it("confirms with the session's token, then refreshes it so the new address shows", async () => {
     const { fetch: f, calls } = confirming();
     const { db, events } = await client(f);
     const result = await db.auth.verifyOtp({ type: "email_change", token_hash: "th1" });
+    expect(calls[0]).toMatchObject({
+      method: "POST",
+      url: `${authUrl}/user/email/confirm`,
+      authorization: "Bearer jwt-signed-in",
+      body: { token_hash: "th1" },
+    });
     expect(result).toEqual({ user: refreshed.user });
     expect(calls[1]).toMatchObject({ url: `${authUrl}/token`, body: { grant_type: "refresh_token", refresh_token: "rt" } });
     expect(db.auth.user()?.email).toBe("new@app.test");
     expect(events).toEqual(["USER_UPDATED"]);
+  });
+
+  it("needs the session of the account that asked, so refuses without one before calling the server", async () => {
+    const { fetch: f, calls } = confirming();
+    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    await expect(db.auth.confirmEmailChange({ tokenHash: "th1" })).rejects.toMatchObject({ code: "not_signed_in" });
+    await expect(db.auth.verifyOtp({ type: "email_change", token_hash: "th1" })).rejects.toMatchObject({
+      code: "not_signed_in",
+    });
+    expect(calls).toHaveLength(0);
   });
 
   it.each([
@@ -272,37 +315,49 @@ describe("AuthClient email change confirmation", () => {
 
   it("refuses an empty token hash before calling the server", async () => {
     const { fetch: f, calls } = confirming();
-    const db = createClient({ ...baseOpts, storage: memoryStorageAdapter(), fetch: f });
+    const { db } = await client(f);
     await expect(db.auth.confirmEmailChange({ tokenHash: " " })).rejects.toMatchObject({ code: "invalid_request" });
     expect(calls).toHaveLength(0);
   });
 
-  it("hydrate confirms a landed ?type=email_change link and removes it from the address bar", async () => {
+  it("hydrate confirms a landed link for a signed-in browser and removes it from the address bar", async () => {
     const { fetch: f, calls } = confirming();
-    const replaceState = jest.fn();
-    const db = createClient({
-      ...baseOpts,
-      storage: memoryStorageAdapter(),
-      fetch: f,
-      location: { href: "https://app.test/settings?token_hash=th1&type=email_change&tab=account", assign: jest.fn() },
-      history: { replaceState },
-    });
-    expect(await db.auth.hydrate()).toBeNull();
+    const storage = memoryStorageAdapter();
+    signedIn(storage);
+    const { db, replaceState, events } = landedAt(landedHref, f, storage);
+    const session = await db.auth.hydrate();
     expect(replaceState).toHaveBeenCalledWith(null, "", "https://app.test/settings?tab=account");
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ url: `${authUrl}/user/email/confirm`, body: { token_hash: "th1" } });
+    expect(calls[0]).toMatchObject({ url: `${authUrl}/user/email/confirm`, authorization: "Bearer jwt-signed-in" });
+    expect(session?.user?.email).toBe("new@app.test");
+    expect(events).toContain("USER_UPDATED");
+  });
+
+  it("hydrate never rejects on a refused link: it reports the error through onAuthStateChange", async () => {
+    const { fetch: f } = confirming(400, { error: "invalid_or_expired_token", status: 400 });
+    const storage = memoryStorageAdapter();
+    signedIn(storage);
+    const { db, replaceState, events, errors } = landedAt(landedHref, f, storage);
+    await Promise.resolve();
+    const session = await db.auth.hydrate();
+    expect(session?.accessToken).toBe("jwt-signed-in");
+    expect(replaceState).toHaveBeenCalledWith(null, "", "https://app.test/settings?tab=account");
+    expect(events).toContain("EMAIL_CHANGE_FAILED");
+    expect(errors).toEqual([expect.objectContaining({ code: "invalid_or_expired_token" })]);
+  });
+
+  it("hydrate leaves a landed link for the app when this browser is not signed in", async () => {
+    const { fetch: f, calls } = confirming();
+    const { db, replaceState } = landedAt(landedHref, f);
+    expect(await db.auth.hydrate()).toBeNull();
+    expect(replaceState).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
   });
 
   it("hydrate leaves a page without an email change link alone", async () => {
     const { fetch: f, calls } = confirming();
-    const replaceState = jest.fn();
-    const db = createClient({
-      ...baseOpts,
-      storage: memoryStorageAdapter(),
-      fetch: f,
-      location: { href: "https://app.test/settings?token_hash=th1&type=recovery", assign: jest.fn() },
-      history: { replaceState },
-    });
+    const storage = memoryStorageAdapter();
+    signedIn(storage);
+    const { db, replaceState } = landedAt("https://app.test/settings?token_hash=th1&type=recovery", f, storage);
     await db.auth.hydrate();
     expect(replaceState).not.toHaveBeenCalled();
     expect(calls).toHaveLength(0);
