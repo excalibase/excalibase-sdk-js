@@ -316,6 +316,54 @@ Linked addresses must be plain ASCII, and the mail says it adds the address to a
 account uses), `last_sign_in_method` (no other identity and no password would be left), `email_not_verified` (the
 account's own address was never proven), `reauthentication_required`, `method_not_enabled`.
 
+## The signed-in account
+
+```ts
+const user = await db.auth.getUser(); // { id, email, fullName, emailVerified, hasPassword, userMetadata, appMetadata, createdAt }
+
+// data merges into userMetadata: each top-level key replaces the stored one, null removes a key
+await db.auth.updateUser({ fullName: "Ada", data: { theme: "dark", banner: null } });
+
+// A new address gets a confirmation link; the old one gets a notice. Nothing changes until the link is opened.
+const { emailChangeRequested } = await db.auth.updateUser(
+  { email: "ada@new.example" },
+  { emailRedirectTo: "https://app.example.com/settings" },
+);
+await db.auth.hydrate(); // on the page the link lands on (?token_hash=...&type=email_change), signed in: confirms it
+await db.auth.confirmEmailChange({ tokenHash }); // or confirm it yourself; verifyOtp({ type: "email_change", token_hash }) does the same
+
+db.auth.onAuthStateChange((event, session, error) => {
+  if (event === "EMAIL_CHANGE_FAILED") showError(error); // a landed link was refused; hydrate() does not throw
+});
+
+// Ends every session of the account; the fresh one returned becomes the current session
+await db.auth.updateUser({ password: "new-secret", currentPassword: "old-secret" });
+```
+
+`userMetadata` is the user's own, at most 16 KB as JSON and 8 levels deep; never trust it for permissions.
+`appMetadata` is read-only here: only a secret key or Studio writes it, and `updateUser` refuses it. Neither goes
+into the access token. A password change needs `currentPassword` or a sign-in in the last 5 minutes; an address
+change needs a recent sign-in and a proven current address; change the two in separate calls
+(`password_and_email_separately`). Confirming needs the session of the account that asked for the change, which is
+then refreshed so the new address shows. When the link lands in a browser that is not signed in, `hydrate()` leaves
+`?token_hash=` on the page: sign the user in, then call `confirmEmailChange` with it. Errors carry the
+server's code: `reauthentication_required`, `email_not_verified`, `invalid_metadata`, `metadata_too_large`,
+`rate_limited` (address changes: 1 a minute, 5 a day), `invalid_or_expired_token`, `email_exists` (another account
+took the address meanwhile), `method_not_enabled`.
+
+### Sign out
+
+```ts
+await db.auth.signOut(); // or { scope: "local" }: this session only
+await db.auth.signOut({ scope: "global" }); // every session of the user, on every device
+await db.auth.signOut({ scope: "others" }); // every session but this one
+```
+
+`local` ignores a server failure and always clears this session. `global` also always clears this session; when the
+server refuses it, it still revokes this session's refresh token the `local` way, then throws the server's error
+(`method_not_enabled`, `invalid_scope`). `others` never clears this
+session and throws a server error as is.
+
 ## API key management
 
 Authenticated users can mint and revoke API keys for the current project:

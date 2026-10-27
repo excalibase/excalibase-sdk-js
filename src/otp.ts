@@ -46,13 +46,18 @@ export function namedOtpError(error: unknown): unknown {
   return new AuthError(error.message, error.message, error.status, error.cause);
 }
 
-/** A magic link that landed on the page: its token hash and the address without it. */
+/** A link that landed on the page: its token hash and the address without it. */
 export interface LandedLink {
   tokenHash: string;
   cleaned: string;
 }
 
 export function readLandedLink(href: string): LandedLink | null {
+  return readLandedTokenHash(href, "magiclink");
+}
+
+/** `?token_hash=…&type=<type>` on the page's address, or null. */
+export function readLandedTokenHash(href: string, type: string): LandedLink | null {
   let url: URL;
   try {
     url = new URL(href);
@@ -60,7 +65,7 @@ export function readLandedLink(href: string): LandedLink | null {
     return null;
   }
   const tokenHash = url.searchParams.get("token_hash");
-  if (tokenHash == null || tokenHash.length === 0 || url.searchParams.get("type") !== "magiclink") return null;
+  if (tokenHash == null || tokenHash.length === 0 || url.searchParams.get("type") !== type) return null;
   url.searchParams.delete("token_hash");
   url.searchParams.delete("type");
   return { tokenHash, cleaned: url.toString() };

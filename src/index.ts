@@ -8,6 +8,16 @@ export { AuthClient } from "./auth";
 export type { HistoryLike, LocationLike, OAuthProvider, OAuthRedirect, SignInWithOAuthOptions } from "./oauth";
 export type { EmailOtpType, SignInWithOtpOptions, VerifyOtpParams } from "./otp";
 export type { LinkEmailOptions, LinkIdentityOptions, UserIdentities, UserIdentity } from "./identities";
+export type {
+  ConfirmEmailChangeResult,
+  SignOutOptions,
+  SignOutScope,
+  UpdateUserOptions,
+  UpdateUserResult,
+  UserAttributes,
+  UserProfile,
+  VerifyEmailChangeParams,
+} from "./user";
 export { GraphqlNamespace } from "./graphql-ns";
 export { RestNamespace } from "./rest-ns";
 export { QueryBuilder, str, unquoted } from "./query-builder";
