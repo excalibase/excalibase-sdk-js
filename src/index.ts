@@ -71,6 +71,7 @@ export type {
   TableMeta,
 } from "./types";
 export type {
+  SignInAsGuestOptions,
   SignInWithPasswordCredentials,
   SignUpCredentials,
   UpdatePasswordWithTokenInput,

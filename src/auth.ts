@@ -1,5 +1,6 @@
 import { AuthHttp } from "./auth-http";
 import { AuthError } from "./errors";
+import { namedGuestError } from "./guest";
 import {
   codeChallenge,
   decodePending,
@@ -57,6 +58,11 @@ import type {
   Subscription,
   User,
 } from "./types";
+
+export interface SignInAsGuestOptions {
+  /** A Cloudflare Turnstile token, needed when the project requires one. */
+  captchaToken?: string;
+}
 
 export interface SignInWithPasswordCredentials {
   email: string;
@@ -261,6 +267,7 @@ export class AuthClient {
   async linkIdentity(options: LinkIdentityOptions): Promise<OAuthRedirect> {
     validateOAuthOptions(options);
     this.requireSession();
+    await this.freshenGuest();
     const verifier = newCodeVerifier();
     const challenge = await codeChallenge(verifier);
     let ticket: LinkTicket;
@@ -290,6 +297,7 @@ export class AuthClient {
   async linkEmail(options: LinkEmailOptions): Promise<void> {
     const type = validateOtpOptions(options);
     this.requireSession();
+    await this.freshenGuest();
     try {
       await this.requestEmail("/user/identities/email", options, type, {});
     } catch (error) {
@@ -428,6 +436,39 @@ export class AuthClient {
     return session;
   }
 
+  /**
+   * Starts a session for a new guest account: no address or password, role `guest`. The guest keeps its id when it
+   * later adds an address (`updateUser({ email })`) or a provider (`linkIdentity`). Send `captchaToken` when the
+   * project requires Cloudflare Turnstile.
+   */
+  async signInAsGuest(options: SignInAsGuestOptions = {}): Promise<Session> {
+    const body = options.captchaToken == null ? {} : { captchaToken: options.captchaToken };
+    let raw: RawAuthResponse;
+    try {
+      raw = await this.http.post<RawAuthResponse>(this.host.authEndpoint("/guest"), body);
+    } catch (error) {
+      throw namedGuestError(error);
+    }
+    const session = this.sessionFromResponse(raw);
+    this.installSession(session, "SIGNED_IN", { persist: true });
+    return session;
+  }
+
+  /**
+   * A guest has nothing to sign in again with, so auth takes a token issued in the last few minutes as a recent
+   * sign-in; refresh first so an address, password or link request is accepted.
+   */
+  private async freshenGuest(): Promise<void> {
+    if (this.session?.user?.isGuest !== true) return;
+    let refreshed: Session | null;
+    try {
+      refreshed = await this.refresh();
+    } catch (error) {
+      throw namedGuestError(error);
+    }
+    if (refreshed != null) this.installSession(refreshed, "TOKEN_REFRESHED", { persist: true });
+  }
+
   async signInWithPassword(credentials: SignInWithPasswordCredentials): Promise<Session> {
     const body = {
       grant_type: "password",
@@ -510,6 +551,7 @@ export class AuthClient {
   async updateUser(attributes: UserAttributes, options: UpdateUserOptions = {}): Promise<UpdateUserResult> {
     const body = updateUserBody(attributes, options);
     this.requireSession();
+    if (attributes.email != null || attributes.password != null) await this.freshenGuest();
     let raw: RawUpdateUserResponse;
     try {
       raw = await this.http.request<RawUpdateUserResponse>("PATCH", this.host.authEndpoint("/user"), body);
@@ -520,7 +562,8 @@ export class AuthClient {
       this.installSession(this.sessionFromResponse(raw.session), "TOKEN_REFRESHED", { persist: true });
     } else if (this.session != null) {
       const { id, email, fullName } = raw.user;
-      this.installSession({ ...this.session, user: { id, email, fullName } }, "USER_UPDATED", { persist: true });
+      const user = raw.user.isGuest === true ? { id, email, fullName, isGuest: true } : { id, email, fullName };
+      this.installSession({ ...this.session, user }, "USER_UPDATED", { persist: true });
     }
     return { user: raw.user, emailChangeRequested: raw.emailChangeRequested === true };
   }

@@ -114,6 +114,7 @@ const USER_ERRORS = new Set([
   "password_and_email_separately",
   "invalid_request",
   "account_disabled",
+  "email_required",
 ]);
 
 /** The same error, its code named by what the server said when it is a known one. */
