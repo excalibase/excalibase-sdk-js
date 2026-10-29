@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.13.0
+
+### Minor Changes
+
+- c98ef39: `db.auth.signInAsGuest({ captchaToken? })` starts a session for a guest account with no address or password (role `guest`); `user().isGuest` says so. A guest keeps its id when it adds an address (`updateUser({ email })`, then the confirmation link) or a provider (`linkIdentity`); the SDK refreshes a guest's session first so those count as a recent sign-in. Refusals carry their code (`method_not_enabled`, `signup_disabled`, `rate_limited`, `captcha_required`, `captcha_failed`, `captcha_unavailable`).
+- 2a4c8f8: `db.auth.linkIdentity({ provider, redirectTo })` and `linkEmail({ email, type })` add Google, GitHub or another address to the signed-in account through PKCE; `getUserIdentities()` lists them and `unlinkIdentity(identity)` removes one unless it is the last way in. Server refusals carry their code (`reauthentication_required`, `identity_already_exists`, `last_sign_in_method`, ...).
+- ef97781: `db.auth.signInWithOAuth({ provider, redirectTo })` and `exchangeCodeForSession(code)` sign end users in with Google or GitHub through PKCE; `hydrate()` finishes a sign-in that lands back on the page (`detectSessionInUrl`, default true).
+- 5902b5b: `db.auth.signInWithOtp({ email, type, emailRedirectTo, shouldCreateUser })` emails a sign-in link or eight-digit code, and `verifyOtp({ type: "email", email, token })` / `verifyOtp({ type: "magiclink", token_hash })` signs in with it through PKCE; `hydrate()` finishes a link that lands back on the page.
+- 26835ee: `db.auth.getUser()` reads the signed-in account with its `userMetadata` and `appMetadata`; `updateUser({ fullName, data, email, password, currentPassword })` changes it (a password change installs the fresh session it returns; an address change mails a link that `hydrate()` or `confirmEmailChange({ tokenHash })` confirms in the signed-in browser of that account, reporting a refused landed link as `EMAIL_CHANGE_FAILED` instead of throwing); `signOut({ scope: "global" | "others" })` ends every or every other session. Server refusals carry their code (`reauthentication_required`, `metadata_too_large`, `password_and_email_separately`, `email_exists`, ...).
+- 3aaf15b: `db.auth.verifyEmail`, `resendVerification`, `resetPasswordForEmail` and `updatePasswordWithToken` wrap auth's existing email verification and password reset routes.
+- bdd1bc6: `db.functions.<id>(args)` calls a function whose id has no dot, such as one named `invite` in Studio or with `deploy_function`; `db.functions.<a>.<b>(args)` still calls the id `a.b`.
+- fb5f4ea: Numeric/decimal and bigint fields are now strings, in GraphQL and REST, on Postgres and MySQL: the API sends them as strings holding every digit (`"19.90"`, `"9223372036854775807"`), because a JavaScript number rounds past 2^53 and loses decimal digits. Generated types say `string` for `BigInteger`, `BigDecimal`, `BigInt` and `Long` columns. Filters and writes still accept a number or a string. If your code does arithmetic on these fields, convert first (`Number(row.price)` when rounding is fine, or a decimal library when it is not).
+
+### Patch Changes
+
+- 0e81929: `db.auth.user()` is `null` after `signInWithApiKey()`: an anonymous session has no user, even when an older auth server answers a placeholder `{ id: 0 }`.
+
 ## 0.12.0
 
 ### Minor Changes
