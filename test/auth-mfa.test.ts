@@ -40,7 +40,9 @@ interface Call {
   body: unknown;
 }
 
-function server(answer: (call: Call) => { status?: number; body?: unknown }) {
+type Answer = { status?: number; body?: unknown };
+
+function server(answer: (call: Call) => Answer | Promise<Answer>) {
   const calls: Call[] = [];
   const f: typeof fetch = async (input, init = {}) => {
     const headers = new Headers(init.headers);
@@ -51,7 +53,7 @@ function server(answer: (call: Call) => { status?: number; body?: unknown }) {
       body: init.body == null ? undefined : JSON.parse(String(init.body)),
     };
     calls.push(call);
-    const { status = 200, body } = answer(call);
+    const { status = 200, body } = await answer(call);
     return new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
   };
   return { fetch: f, calls };
@@ -63,10 +65,15 @@ async function client(fetchImpl: typeof fetch, prepare: (storage: StorageAdapter
   const db = createClient({ ...baseOpts, storage, fetch: fetchImpl });
   await db.auth.hydrate();
   const events: AuthChangeEvent[] = [];
-  db.auth.onAuthStateChange((event) => events.push(event));
+  const payloads: string[] = [];
+  db.auth.onAuthStateChange((event, session) => {
+    events.push(event);
+    payloads.push(JSON.stringify(session));
+  });
   await Promise.resolve();
   events.length = 0;
-  return { db, storage, events };
+  payloads.length = 0;
+  return { db, storage, events, payloads };
 }
 
 function flush(): Promise<void> {
@@ -96,6 +103,16 @@ describe("auth.mfa.enroll", () => {
     expect(calls[1]!.body).toEqual({ factorType: "totp" });
   });
 
+  it("keeps the secret out of storage and events", async () => {
+    const enrolled = { id: "f-2", factorType: "totp", friendlyName: "", status: "unverified", totp: { secret: "SECRETBASE32", uri: "otpauth://totp/x" } };
+    const { fetch: f } = server(() => ({ status: 201, body: enrolled }));
+    const { db, storage, events } = await client(f);
+    await db.auth.mfa.enroll({ factorType: "totp" });
+    await flush();
+    expect(storage.getItem(sessionKey)).not.toContain("SECRETBASE32");
+    expect(events).toEqual([]);
+  });
+
   it("names the server's refusal and sends nothing when signed out", async () => {
     const { fetch: f, calls } = server(() => ({ status: 403, body: { error: "insufficient_aal" } }));
     const { db } = await client(f);
@@ -120,16 +137,19 @@ describe("auth.mfa.challenge and verify", () => {
   it("sends the stored refresh token, installs the aal2 session like a sign-in and returns the recovery codes once", async () => {
     const codes = Array.from({ length: 10 }, (_, index) => `code-${index}`);
     const { fetch: f, calls } = server(() => ({ body: { ...aal2Session, recoveryCodes: codes } }));
-    const { db, storage, events } = await client(f);
+    const { db, storage, events, payloads } = await client(f);
     const result = await db.auth.mfa.verify({ factorId: "f-1", challengeId: "c-1", code: "123456" });
     expect(calls[0]).toMatchObject({ method: "POST", url: `${authUrl}/factors/f-1/verify`, authorization: `Bearer ${aal1Token}` });
     expect(calls[0]!.body).toEqual({ challengeId: "c-1", code: "123456", refreshToken: "rt-aal1" });
     expect(result.recoveryCodes).toEqual(codes);
     expect(result.session).toMatchObject({ accessToken: aal2Token, refreshToken: "rt-aal2", user: member });
     expect(db.auth.currentSession()).toEqual(result.session);
-    expect(events).toEqual(["SIGNED_IN"]);
+    expect(events).toEqual(["MFA_CHALLENGE_VERIFIED"]);
     await flush();
-    expect(JSON.parse(storage.getItem(sessionKey) as string).refreshToken).toBe("rt-aal2");
+    const stored = storage.getItem(sessionKey) as string;
+    expect(JSON.parse(stored).refreshToken).toBe("rt-aal2");
+    expect(stored).not.toContain("code-");
+    expect(payloads.join()).not.toContain("code-");
   });
 
   it("leaves recoveryCodes out when the factor is not the account's first", async () => {
@@ -152,6 +172,7 @@ describe("auth.mfa.challenge and verify", () => {
     [429, "too_many_attempts"],
     [404, "method_not_enabled"],
     [403, "email_required"],
+    [403, "insufficient_aal"],
   ])("names %i %s", async (status, code) => {
     const { fetch: f } = server(() => ({ status, body: { error: code } }));
     const { db } = await client(f);
@@ -182,7 +203,7 @@ describe("auth.mfa.unenroll and listFactors", () => {
     const { fetch: f, calls } = server(() => ({ status: 204 }));
     const { db } = await client(f);
     await expect(db.auth.mfa.unenroll({ factorId: "f-1" })).resolves.toBeUndefined();
-    expect(calls[0]).toMatchObject({ method: "DELETE", url: `${authUrl}/factors/f-1`, authorization: `Bearer ${aal1Token}` });
+    expect(calls[0]).toMatchObject({ method: "DELETE", url: `${authUrl}/factors/f-1`, authorization: `Bearer ${aal1Token}`, body: undefined });
   });
 
   it("names insufficient_aal on unenroll", async () => {
@@ -202,10 +223,10 @@ describe("auth.mfa.unenroll and listFactors", () => {
     expect(calls[0]).toMatchObject({ method: "GET", url: `${authUrl}/factors`, authorization: `Bearer ${aal1Token}` });
   });
 
-  it("reads a missing list as empty", async () => {
-    const { fetch: f } = server(() => ({ body: {} }));
+  it("refuses a list that is not one", async () => {
+    const { fetch: f } = server(() => ({ body: { factors: "nope" } }));
     const { db } = await client(f);
-    await expect(db.auth.mfa.listFactors()).resolves.toEqual({ all: [], totp: [], recoveryCodesRemaining: 0 });
+    await expect(db.auth.mfa.listFactors()).rejects.toMatchObject({ code: "invalid_response" });
   });
 });
 
@@ -294,12 +315,12 @@ describe("auth.mfa recovery codes", () => {
     const recovered = { ...aal2Session, accessToken: accessToken({ aal: "aal2", amr: ["password", "recovery"] }) };
     const { fetch: f, calls } = server(() => ({ body: recovered }));
     const { db, events } = await client(f);
-    const session = await db.auth.mfa.useRecoveryCode({ code: "abcd-efgh" });
+    const { session } = await db.auth.mfa.useRecoveryCode({ code: "abcd-efgh" });
     expect(calls[0]).toMatchObject({ method: "POST", url: `${authUrl}/factors/recovery`, authorization: `Bearer ${aal1Token}` });
     expect(calls[0]!.body).toEqual({ code: "abcd-efgh", refreshToken: "rt-aal1" });
     expect(session.accessToken).toBe(recovered.accessToken);
     expect(db.auth.currentSession()).toEqual(session);
-    expect(events).toEqual(["SIGNED_IN"]);
+    expect(events).toEqual(["MFA_CHALLENGE_VERIFIED"]);
   });
 
   it("names a spent or wrong recovery code", async () => {
@@ -326,5 +347,132 @@ describe("auth.mfa recovery codes", () => {
     const { fetch: f } = server(() => ({ status: 401, body: { error: "invalid refresh token" } }));
     const { db } = await client(f);
     await expect(db.auth.mfa.useRecoveryCode({ code: "x" })).rejects.toMatchObject({ code: "http_401", message: "invalid refresh token" });
+  });
+});
+
+describe("auth.mfa response shapes", () => {
+  it.each([
+    ["verify without an access token", { refreshToken: "rt", user: member }],
+    ["verify with recovery codes that are not a list", { ...aal2Session, recoveryCodes: "abc" }],
+  ])("refuses %s and keeps the session", async (_name, body) => {
+    const { fetch: f } = server(() => ({ body }));
+    const { db, events } = await client(f);
+    await expect(db.auth.mfa.verify({ factorId: "f-1", challengeId: "c-1", code: "1" })).rejects.toMatchObject({ code: "invalid_response" });
+    expect(db.auth.currentSession()?.accessToken).toBe(aal1Token);
+    expect(events).toEqual([]);
+  });
+
+  it("refuses regenerated codes that are not a list", async () => {
+    const { fetch: f } = server(() => ({ body: {} }));
+    const { db } = await client(f);
+    await expect(db.auth.mfa.regenerateRecoveryCodes()).rejects.toMatchObject({ code: "invalid_response" });
+  });
+});
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => (resolve = settle));
+  return { promise, resolve };
+}
+
+describe("auth.mfa step-up against the background refresh", () => {
+  const refreshedAal1 = { accessToken: accessToken({ aal: "aal1", amr: ["password"], n: 2 }), refreshToken: "rt-aal1-next", tokenType: "Bearer", expiresIn: 3600, user: member };
+  /** Expires in 61 s, so auto-refresh fires after 1 s. */
+  const nearlyExpired = (storage: StorageAdapter) =>
+    storage.setItem(sessionKey, JSON.stringify({ accessToken: aal1Token, refreshToken: "rt-aal1", tokenType: "Bearer", expiresAt: Date.now() + 61_000, user: member }));
+
+  async function autoRefreshingClient(fetchImpl: typeof fetch) {
+    const storage = memoryStorageAdapter();
+    nearlyExpired(storage);
+    const db = createClient({ ...baseOpts, autoRefreshToken: true, storage, fetch: fetchImpl });
+    await db.auth.hydrate();
+    const events: AuthChangeEvent[] = [];
+    db.auth.onAuthStateChange((event) => events.push(event));
+    await jest.advanceTimersByTimeAsync(0);
+    events.length = 0;
+    return { db, events };
+  }
+
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+
+  it("waits for a refresh in flight and verifies with the refreshed token", async () => {
+    const refreshGate = deferred<Answer>();
+    const { fetch: f, calls } = server((call) => (call.url.endsWith("/token") ? refreshGate.promise : { body: aal2Session }));
+    const { db, events } = await autoRefreshingClient(f);
+    await jest.advanceTimersByTimeAsync(1_000);
+    expect(calls.map((call) => call.url)).toEqual([`${authUrl}/token`]);
+
+    const verifying = db.auth.mfa.verify({ factorId: "f-1", challengeId: "c-1", code: "123456" });
+    await jest.advanceTimersByTimeAsync(0);
+    expect(calls).toHaveLength(1);
+    refreshGate.resolve({ body: refreshedAal1 });
+    await verifying;
+
+    expect(calls[1]!.body).toEqual({ challengeId: "c-1", code: "123456", refreshToken: "rt-aal1-next" });
+    expect(db.auth.currentSession()?.accessToken).toBe(aal2Token);
+    expect(events).toEqual(["TOKEN_REFRESHED", "MFA_CHALLENGE_VERIFIED"]);
+    db.auth.stopAutoRefresh();
+  });
+
+  it("holds a refresh that comes due during verify until the aal2 session is stored, then refreshes that one", async () => {
+    const verifyGate = deferred<Answer>();
+    const refreshedAal2 = { ...aal2Session, accessToken: accessToken({ aal: "aal2", amr: ["password", "totp"], n: 2 }), refreshToken: "rt-aal2-next" };
+    const { fetch: f, calls } = server((call) => (call.url.endsWith("/token") ? { body: refreshedAal2 } : verifyGate.promise));
+    const { db, events } = await autoRefreshingClient(f);
+
+    const verifying = db.auth.mfa.verify({ factorId: "f-1", challengeId: "c-1", code: "123456" });
+    await jest.advanceTimersByTimeAsync(1_000);
+    expect(calls.map((call) => call.url)).toEqual([`${authUrl}/factors/f-1/verify`]);
+    verifyGate.resolve({ body: { ...aal2Session, expiresIn: 61 } });
+    await verifying;
+    await jest.advanceTimersByTimeAsync(1_000);
+
+    expect(calls.map((call) => call.url)).toEqual([`${authUrl}/factors/f-1/verify`, `${authUrl}/token`]);
+    expect(calls[1]!.body).toEqual({ grant_type: "refresh_token", refresh_token: "rt-aal2" });
+    expect(db.auth.currentSession()?.refreshToken).toBe("rt-aal2-next");
+    expect(events).toEqual(["MFA_CHALLENGE_VERIFIED", "TOKEN_REFRESHED"]);
+    db.auth.stopAutoRefresh();
+  });
+
+  it("does not store the aal2 session when the user signed out meanwhile", async () => {
+    const verifyGate = deferred<Answer>();
+    const { fetch: f } = server((call) => (call.url.endsWith("/verify") ? verifyGate.promise : { status: 204 }));
+    const { db } = await autoRefreshingClient(f);
+    const verifying = db.auth.mfa.verify({ factorId: "f-1", challengeId: "c-1", code: "123456" });
+    const outcome = verifying.catch((error: unknown) => error);
+    await db.auth.signOut();
+    verifyGate.resolve({ body: aal2Session });
+    await expect(outcome).resolves.toMatchObject({ code: "session_changed" });
+    expect(db.auth.currentSession()).toBeNull();
+    db.auth.stopAutoRefresh();
+  });
+
+  it("retries once with the new refresh token when the presented one was rotated meanwhile", async () => {
+    const firstVerify = deferred<Answer>();
+    const fresh = { ...refreshedAal1, refreshToken: "rt-after-password" };
+    let verifyCount = 0;
+    const { fetch: f, calls } = server((call) => {
+      if (call.url.endsWith("/user")) return { body: { user: { ...member }, session: fresh } };
+      verifyCount += 1;
+      return verifyCount === 1 ? firstVerify.promise : { body: aal2Session };
+    });
+    const { db } = await autoRefreshingClient(f);
+    const verifying = db.auth.mfa.verify({ factorId: "f-1", challengeId: "c-1", code: "123456" });
+    await jest.advanceTimersByTimeAsync(0);
+    await db.auth.updateUser({ password: "new-secret", currentPassword: "old-secret" });
+    firstVerify.resolve({ status: 401, body: { error: "invalid refresh token" } });
+    await expect(verifying).resolves.toMatchObject({ session: { accessToken: aal2Token } });
+    const verifies = calls.filter((call) => call.url.endsWith("/verify"));
+    expect(verifies.map((call) => (call.body as { refreshToken: string }).refreshToken)).toEqual(["rt-aal1", "rt-after-password"]);
+    db.auth.stopAutoRefresh();
+  });
+
+  it("does not retry a refused refresh token that nothing replaced", async () => {
+    const { fetch: f, calls } = server(() => ({ status: 401, body: { error: "invalid refresh token" } }));
+    const { db } = await autoRefreshingClient(f);
+    await expect(db.auth.mfa.useRecoveryCode({ code: "x" })).rejects.toMatchObject({ status: 401 });
+    expect(calls).toHaveLength(1);
+    db.auth.stopAutoRefresh();
   });
 });

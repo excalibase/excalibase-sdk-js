@@ -335,13 +335,15 @@ await db.auth.mfa.regenerateRecoveryCodes(); // { recoveryCodes }, replaces the 
 await db.auth.mfa.unenroll({ factorId: factor.id });
 ```
 
-`verify`, `challengeAndVerify` and `useRecoveryCode` rotate this session into an `aal2` one, store it and fire
-`SIGNED_IN`, as a sign-in does. `getAuthenticatorAssuranceLevel` reads `aal` and `amr` from the access token without
+`verify`, `challengeAndVerify` and `useRecoveryCode` (which returns `{ session }`) rotate this session into an `aal2`
+one, store it and fire `MFA_CHALLENGE_VERIFIED`. They wait for a background token refresh in flight, and a refresh
+that comes due meanwhile waits for them; if the user signs out meanwhile they throw `session_changed` and store
+nothing. `getAuthenticatorAssuranceLevel` reads `aal` and `amr` from the access token without
 a request (null when signed out or MFA is off) and asks for the factor list to work out `nextLevel`. Once a factor
 is verified, enrolling or removing a factor, new recovery codes, and changing the address, password or linked
 identities need `aal2`. Guests cannot enroll (`email_required`). A challenge lasts 5 minutes; after five wrong codes for a factor in 5
 minutes it answers `too_many_attempts` for a while. Errors carry the server's code: `method_not_enabled`, `insufficient_aal`,
-`invalid_code`, `invalid_challenge`, `too_many_attempts`.
+`invalid_code`, `invalid_challenge`, `too_many_attempts`, `session_changed`, `invalid_response`.
 
 ## Link identities to the signed-in account
 

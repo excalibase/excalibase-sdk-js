@@ -29,7 +29,9 @@ export type AuthChangeEvent =
   | "TOKEN_REFRESHED"
   | "USER_UPDATED"
   /** An email change link that landed on the page was refused; the error is the handler's third argument. */
-  | "EMAIL_CHANGE_FAILED";
+  | "EMAIL_CHANGE_FAILED"
+  /** A TOTP or recovery code stepped this session up to aal2; the session is the new one. */
+  | "MFA_CHALLENGE_VERIFIED";
 
 export type AuthChangeHandler = (event: AuthChangeEvent, session: Session | null, error?: unknown) => void;
 

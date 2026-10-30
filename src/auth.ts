@@ -1,7 +1,7 @@
 import { AuthHttp } from "./auth-http";
 import { AuthError } from "./errors";
 import { namedGuestError } from "./guest";
-import { MfaApi } from "./mfa";
+import { MfaApi, type StepUpResponse } from "./mfa";
 import {
   codeChallenge,
   decodePending,
@@ -116,6 +116,10 @@ export class AuthClient {
   private readonly listeners = new Set<AuthChangeHandler>();
   private readonly tokenManager: TokenManager;
   private session: Session | null = null;
+  /** Changes whenever the stored tokens change, so a request can tell its session was replaced meanwhile. */
+  private sessionGeneration = 0;
+  /** Requests that spend the refresh token run one at a time, each storing its result before the next starts. */
+  private tokenLane: Promise<unknown> = Promise.resolve();
   private hydrated = false;
   private readonly detectSessionInUrl: boolean;
   private readonly location?: LocationLike;
@@ -137,8 +141,7 @@ export class AuthClient {
     this.history = opts.history;
     this.tokenManager = new TokenManager({
       session: null,
-      refresh: () => this.refresh(),
-      onRefreshed: (next) => this.installSession(next, "TOKEN_REFRESHED", { persist: true }),
+      refresh: () => this.refreshAndInstall("TOKEN_REFRESHED"),
     });
     if (opts.autoRefreshToken) {
       this.tokenManager.start();
@@ -147,11 +150,7 @@ export class AuthClient {
       http: this.http,
       endpoint: (path) => this.host.authEndpoint(path),
       session: () => this.session,
-      signIn: (raw) => {
-        const session = this.sessionFromResponse(raw);
-        this.installSession(session, "SIGNED_IN", { persist: true });
-        return session;
-      },
+      stepUp: (send) => this.stepUp(send),
     });
   }
 
@@ -473,13 +472,11 @@ export class AuthClient {
    */
   private async freshenGuest(): Promise<void> {
     if (this.session?.user?.isGuest !== true) return;
-    let refreshed: Session | null;
     try {
-      refreshed = await this.refresh();
+      await this.refreshAndInstall("TOKEN_REFRESHED");
     } catch (error) {
       throw namedGuestError(error);
     }
-    if (refreshed != null) this.installSession(refreshed, "TOKEN_REFRESHED", { persist: true });
   }
 
   async signInWithPassword(credentials: SignInWithPasswordCredentials): Promise<Session> {
@@ -593,10 +590,8 @@ export class AuthClient {
     } catch (error) {
       throw namedUserError(error);
     }
-    const refreshed = await this.refresh();
-    if (refreshed == null) return { user: null };
-    this.installSession(refreshed, "USER_UPDATED", { persist: true });
-    return { user: refreshed.user };
+    const refreshed = await this.refreshAndInstall("USER_UPDATED");
+    return { user: refreshed?.user ?? null };
   }
 
   /**
@@ -604,7 +599,69 @@ export class AuthClient {
    * token is present (password login path); falls back to api_key re-exchange
    * (SDK was bootstrapped anonymously or with an api-key-derived session).
    */
-  async refresh(): Promise<Session | null> {
+  refresh(): Promise<Session | null> {
+    return this.inTokenLane(() => this.requestRefresh());
+  }
+
+  /** Refreshes and stores the result, unless the session was replaced (sign-out, step-up) while it was asked for. */
+  private refreshAndInstall(event: AuthChangeEvent): Promise<Session | null> {
+    return this.inTokenLane(async () => {
+      const generation = this.sessionGeneration;
+      const next = await this.requestRefresh();
+      if (generation !== this.sessionGeneration) return this.session;
+      if (next != null) this.installSession(next, event, { persist: true });
+      return next;
+    });
+  }
+
+  /**
+   * Presents the stored refresh token to a step-up route and stores the aal2 session it returns. Retries once when
+   * the token was rotated by something else meanwhile; refuses to store a result for a session that is gone.
+   */
+  private stepUp<T extends StepUpResponse>(send: (refreshToken: string) => Promise<T>): Promise<{ session: Session; response: T }> {
+    return this.inTokenLane(async () => {
+      let attempt = this.stepUpAttempt();
+      let response: T;
+      try {
+        response = await send(attempt.refreshToken);
+      } catch (error) {
+        const retry = isRefusedRefreshToken(error) ? this.stepUpRetry(attempt) : null;
+        if (retry == null) throw error;
+        attempt = retry;
+        response = await send(attempt.refreshToken);
+      }
+      if (attempt.generation !== this.sessionGeneration) {
+        throw new AuthError("The session changed while this was in flight", "session_changed");
+      }
+      const session = this.sessionFromResponse(response);
+      this.installSession(session, "MFA_CHALLENGE_VERIFIED", { persist: true });
+      return { session, response };
+    });
+  }
+
+  private stepUpAttempt(): { refreshToken: string; generation: number; userId: number | null } {
+    const refreshToken = this.session?.refreshToken;
+    if (this.session?.accessToken == null || refreshToken == null || refreshToken.length === 0) {
+      throw new AuthError("Sign in with an account first", "not_signed_in");
+    }
+    return { refreshToken, generation: this.sessionGeneration, userId: this.session.user?.id ?? null };
+  }
+
+  /** Only the same account's session, holding a different refresh token, is worth one more try. */
+  private stepUpRetry(previous: { refreshToken: string; userId: number | null }): ReturnType<AuthClient["stepUpAttempt"]> | null {
+    const current = this.session;
+    if (current?.refreshToken == null || current.refreshToken === previous.refreshToken) return null;
+    if ((current.user?.id ?? null) !== previous.userId) return null;
+    return this.stepUpAttempt();
+  }
+
+  private inTokenLane<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.tokenLane.then(task, task);
+    this.tokenLane = run.catch(() => undefined);
+    return run;
+  }
+
+  private async requestRefresh(): Promise<Session | null> {
     const refreshToken = this.session?.refreshToken;
     if (refreshToken != null && refreshToken.length > 0) {
       const body = { grant_type: "refresh_token", refresh_token: refreshToken };
@@ -685,6 +742,9 @@ export class AuthClient {
     event: AuthChangeEvent,
     opts: { persist: boolean },
   ): void {
+    if (session?.accessToken !== this.session?.accessToken || session?.refreshToken !== this.session?.refreshToken) {
+      this.sessionGeneration += 1;
+    }
     this.session = session;
     this.tokenManager.setSession(session);
     if (opts.persist) {
@@ -715,6 +775,10 @@ export class AuthClient {
       // Storage failures shouldn't crash the caller — session is still in memory.
     }
   }
+}
+
+function isRefusedRefreshToken(error: unknown): boolean {
+  return error instanceof AuthError && error.status === 401 && error.message === "invalid refresh token";
 }
 
 function requireValue(value: string | undefined, message: string): void {

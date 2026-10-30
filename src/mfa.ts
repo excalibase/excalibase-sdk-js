@@ -84,13 +84,19 @@ export interface MfaRecoveryCodes {
   recoveryCodes: string[];
 }
 
+export interface MfaRecoveryResult {
+  session: Session;
+}
+
+export type StepUpResponse = RawAuthResponse & { recoveryCodes?: unknown };
+
 /** What the MFA calls need from the AuthClient. */
 export interface MfaHost {
   http: AuthHttp;
   endpoint(path: string): string;
   session(): Session | null;
-  /** Stores the session the server returned and announces it the way a sign-in does. */
-  signIn(raw: RawAuthResponse): Session;
+  /** Sends the stored refresh token, then stores the aal2 session and fires MFA_CHALLENGE_VERIFIED. */
+  stepUp<T extends StepUpResponse>(send: (refreshToken: string) => Promise<T>): Promise<{ session: Session; response: T }>;
 }
 
 /** The codes the factor routes answer with; any other text is not a code. */
@@ -107,6 +113,22 @@ const MFA_ERRORS = new Set([
 function namedMfaError(error: unknown): unknown {
   if (!(error instanceof AuthError) || !MFA_ERRORS.has(error.message)) return error;
   return new AuthError(error.message, error.message, error.status, error.cause);
+}
+
+function invalidResponse(): AuthError {
+  return new AuthError("The auth server sent an unexpected response", "invalid_response");
+}
+
+function isStringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+/** Checked before anything is stored, so a malformed answer never replaces the session. */
+async function checkedStepUp<T extends StepUpResponse>(request: Promise<T>): Promise<T> {
+  const response = await request;
+  if (typeof response?.accessToken !== "string" || response.accessToken.length === 0) throw invalidResponse();
+  if (response.recoveryCodes !== undefined && !isStringList(response.recoveryCodes)) throw invalidResponse();
+  return response;
 }
 
 /** TOTP factors and recovery codes of the signed-in account (`client.auth.mfa`). */
@@ -128,13 +150,13 @@ export class MfaApi {
 
   /** Checks a code; on success this session is rotated to aal2 and stored like a sign-in. */
   async verify(params: MfaVerifyParams): Promise<MfaVerifyResult> {
-    const refreshToken = this.refreshToken();
-    const body = { challengeId: params.challengeId, code: params.code, refreshToken };
-    const raw = await this.call(() =>
-      this.host.http.post<RawAuthResponse & { recoveryCodes?: string[] }>(this.factorUrl(params.factorId, "/verify"), body),
+    const url = this.factorUrl(params.factorId, "/verify");
+    const { session, response } = await this.call(() =>
+      this.host.stepUp((refreshToken) =>
+        checkedStepUp(this.host.http.post<StepUpResponse>(url, { challengeId: params.challengeId, code: params.code, refreshToken })),
+      ),
     );
-    const session = this.host.signIn(raw);
-    return raw.recoveryCodes == null ? { session } : { session, recoveryCodes: raw.recoveryCodes };
+    return isStringList(response.recoveryCodes) ? { session, recoveryCodes: response.recoveryCodes } : { session };
   }
 
   async challengeAndVerify(params: MfaChallengeAndVerifyParams): Promise<MfaVerifyResult> {
@@ -151,7 +173,8 @@ export class MfaApi {
     const raw = await this.call(() =>
       this.host.http.get<{ factors?: Factor[]; recoveryCodesRemaining?: number }>(this.host.endpoint("/factors")),
     );
-    const all = raw.factors ?? [];
+    if (!Array.isArray(raw.factors)) throw invalidResponse();
+    const all = raw.factors;
     return {
       all,
       totp: all.filter((factor) => factor.factorType === "totp" && factor.status === "verified"),
@@ -177,37 +200,27 @@ export class MfaApi {
   }
 
   /** Spends a single-use recovery code in place of a TOTP code; the aal2 session is stored like a sign-in. */
-  async useRecoveryCode(params: MfaUseRecoveryCodeParams): Promise<Session> {
-    const body = { code: params.code, refreshToken: this.refreshToken() };
-    const raw = await this.call(() => this.host.http.post<RawAuthResponse>(this.host.endpoint("/factors/recovery"), body));
-    return this.host.signIn(raw);
+  async useRecoveryCode(params: MfaUseRecoveryCodeParams): Promise<MfaRecoveryResult> {
+    const url = this.host.endpoint("/factors/recovery");
+    const { session } = await this.call(() =>
+      this.host.stepUp((refreshToken) => checkedStepUp(this.host.http.post<StepUpResponse>(url, { code: params.code, refreshToken }))),
+    );
+    return { session };
   }
 
   /** Replaces every recovery code with a new set, shown once. Needs aal2. */
-  regenerateRecoveryCodes(): Promise<MfaRecoveryCodes> {
-    return this.call(() => this.host.http.post<MfaRecoveryCodes>(this.host.endpoint("/factors/recovery-codes"), {}));
+  async regenerateRecoveryCodes(): Promise<MfaRecoveryCodes> {
+    const raw = await this.call(() => this.host.http.post<{ recoveryCodes?: unknown }>(this.host.endpoint("/factors/recovery-codes"), {}));
+    if (!isStringList(raw.recoveryCodes)) throw invalidResponse();
+    return { recoveryCodes: raw.recoveryCodes };
   }
 
   private factorUrl(factorId: string, suffix: string): string {
     return this.host.endpoint(`/factors/${encodeURIComponent(factorId)}${suffix}`);
   }
 
-  private refreshToken(): string {
-    const refreshToken = this.requireSession().refreshToken;
-    if (refreshToken == null || refreshToken.length === 0) {
-      throw new AuthError("This session cannot be stepped up; sign in with an account first", "not_signed_in");
-    }
-    return refreshToken;
-  }
-
-  private requireSession(): Session {
-    const session = this.host.session();
-    if (session?.accessToken == null) throw new AuthError("Sign in first", "not_signed_in");
-    return session;
-  }
-
   private async call<T>(send: () => Promise<T>): Promise<T> {
-    this.requireSession();
+    if (this.host.session()?.accessToken == null) throw new AuthError("Sign in first", "not_signed_in");
     try {
       return await send();
     } catch (error) {

@@ -7,8 +7,10 @@ export type { DatabaseShape, AnyDatabase, RowOf } from "./client";
 export { AuthClient } from "./auth";
 export type { HistoryLike, LocationLike, OAuthProvider, OAuthRedirect, SignInWithOAuthOptions } from "./oauth";
 export type { EmailOtpType, SignInWithOtpOptions, VerifyOtpParams } from "./otp";
-export { MfaApi } from "./mfa";
 export type {
+  MfaApi,
+  MfaHost,
+  MfaRecoveryResult,
   AuthenticatorAssuranceLevel,
   Factor,
   FactorStatus,
