@@ -1,6 +1,7 @@
 import { AuthHttp } from "./auth-http";
 import { AuthError } from "./errors";
 import { namedGuestError } from "./guest";
+import { MfaApi } from "./mfa";
 import {
   codeChallenge,
   decodePending,
@@ -119,6 +120,8 @@ export class AuthClient {
   private readonly detectSessionInUrl: boolean;
   private readonly location?: LocationLike;
   private readonly history?: HistoryLike;
+  /** TOTP factors and recovery codes of the signed-in account. */
+  readonly mfa: MfaApi;
 
   constructor(opts: AuthClientOptions) {
     this.host = opts.client;
@@ -140,6 +143,16 @@ export class AuthClient {
     if (opts.autoRefreshToken) {
       this.tokenManager.start();
     }
+    this.mfa = new MfaApi({
+      http: this.http,
+      endpoint: (path) => this.host.authEndpoint(path),
+      session: () => this.session,
+      signIn: (raw) => {
+        const session = this.sessionFromResponse(raw);
+        this.installSession(session, "SIGNED_IN", { persist: true });
+        return session;
+      },
+    });
   }
 
   currentSession(): Session | null {

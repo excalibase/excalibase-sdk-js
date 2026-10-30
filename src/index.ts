@@ -7,6 +7,24 @@ export type { DatabaseShape, AnyDatabase, RowOf } from "./client";
 export { AuthClient } from "./auth";
 export type { HistoryLike, LocationLike, OAuthProvider, OAuthRedirect, SignInWithOAuthOptions } from "./oauth";
 export type { EmailOtpType, SignInWithOtpOptions, VerifyOtpParams } from "./otp";
+export { MfaApi } from "./mfa";
+export type {
+  AuthenticatorAssuranceLevel,
+  Factor,
+  FactorStatus,
+  MfaAssuranceLevel,
+  MfaChallenge,
+  MfaChallengeAndVerifyParams,
+  MfaChallengeParams,
+  MfaEnrollParams,
+  MfaEnrollResult,
+  MfaListFactorsResult,
+  MfaRecoveryCodes,
+  MfaUnenrollParams,
+  MfaUseRecoveryCodeParams,
+  MfaVerifyParams,
+  MfaVerifyResult,
+} from "./mfa";
 export type { LinkEmailOptions, LinkIdentityOptions, UserIdentities, UserIdentity } from "./identities";
 export type {
   ConfirmEmailChangeResult,
