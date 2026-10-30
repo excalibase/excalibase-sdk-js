@@ -73,6 +73,10 @@ export class TokenManager {
   }
 
   private schedule(): void {
+    if (this.handle !== null) {
+      this.clearTimeoutFn(this.handle);
+      this.handle = null;
+    }
     if (this.stopped || !this.started || this.session == null) {
       return;
     }
