@@ -312,6 +312,39 @@ no longer a guest and its role `guest` becomes `user` (a role the project gave i
 are deleted. Errors carry the server's code: `method_not_enabled`, `signup_disabled`, `rate_limited`,
 `captcha_required`, `captcha_failed`, `captcha_unavailable`.
 
+## Multi-factor authentication (TOTP)
+
+When the project turns MFA on, a signed-in user adds an authenticator app; later sign-ins start at `aal1` and step
+up to `aal2` with a code from the app or a one-time recovery code. A permission can require
+`x-excalibase-aal = aal2`.
+
+```ts
+// Enroll: show totp.uri as a QR code (or totp.secret to type in), then confirm with a code from the app
+const factor = await db.auth.mfa.enroll({ factorType: "totp", friendlyName: "Phone" });
+const { recoveryCodes } = await db.auth.mfa.challengeAndVerify({ factorId: factor.id, code: "123456" });
+// recoveryCodes: 10 single-use codes, returned once with the account's first verified factor
+
+// After each sign-in
+const { currentLevel, nextLevel } = await db.auth.mfa.getAuthenticatorAssuranceLevel();
+if (currentLevel === "aal1" && nextLevel === "aal2") {
+  const { totp } = await db.auth.mfa.listFactors();
+  await db.auth.mfa.challengeAndVerify({ factorId: totp[0].id, code }); // or useRecoveryCode({ code })
+}
+
+await db.auth.mfa.regenerateRecoveryCodes(); // { recoveryCodes }, replaces the old set
+await db.auth.mfa.unenroll({ factorId: factor.id });
+```
+
+`verify`, `challengeAndVerify` and `useRecoveryCode` (which returns `{ session }`) rotate this session into an `aal2`
+one, store it and fire `MFA_CHALLENGE_VERIFIED`. They wait for a background token refresh in flight, and a refresh
+that comes due meanwhile waits for them; if the user signs out meanwhile they throw `session_changed` and store
+nothing. `getAuthenticatorAssuranceLevel` reads `aal` and `amr` from the access token without
+a request (null when signed out or MFA is off) and asks for the factor list to work out `nextLevel`. Once a factor
+is verified, enrolling or removing a factor, new recovery codes, and changing the address, password or linked
+identities need `aal2`. Guests cannot enroll (`email_required`). A challenge lasts 5 minutes; after five wrong codes for a factor in 5
+minutes it answers `too_many_attempts` for a while. Errors carry the server's code: `method_not_enabled`, `insufficient_aal`,
+`invalid_code`, `invalid_challenge`, `too_many_attempts`, `session_changed`, `invalid_response`.
+
 ## Link identities to the signed-in account
 
 A signed-in user adds Google, GitHub or another address to the one account, then signs in with any of them.
