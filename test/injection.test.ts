@@ -496,3 +496,55 @@ describe("REST rejects undefined nested inside values", () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+describe("deep and shared JSON values", () => {
+  type Node = Record<string, unknown>;
+  const bullets = (levels: number): Node => {
+    let node: Node = { type: "paragraph", content: [{ type: "text", text: "leaf" }] };
+    for (let i = 0; i < levels; i++) {
+      node = { type: "bullet_list", content: [{ type: "list_item", content: [node] }] };
+    }
+    return { type: "doc", content: [node] };
+  };
+  const nest = (depth: number): Node => {
+    let node: Node = { v: 1 };
+    for (let i = 0; i < depth; i++) node = { n: node };
+    return node;
+  };
+  const restDb = () =>
+    createClient<any>({ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ...base,
+      fetch: (async () => new Response("[]", { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch,
+    });
+  const restInsert = (v: unknown) => restDb().from("users", { table: "users" }).via("rest").insert({ meta: v }).execute();
+
+  it.each([5, 8])("accepts a %i-level ProseMirror doc on both transports", async (levels) => {
+    const doc = bullets(levels);
+    await expect(restInsert(doc)).resolves.toEqual([]);
+    expect(() => plain().insert({ meta: doc }).toGraphql()).not.toThrow();
+    expect(() => plain().where({ m: { jsonContains: doc } }).toRest()).not.toThrow();
+    expect(() => plain().where({ m: { jsonContains: doc } }).toGraphql()).not.toThrow();
+  });
+  it("accepts a shared, non-cyclic reference", async () => {
+    const shared = { x: 1 };
+    const value = { a: shared, b: shared, c: [shared, shared] };
+    await expect(restInsert(value)).resolves.toEqual([]);
+    expect(() => plain().insert({ meta: value }).toGraphql()).not.toThrow();
+  });
+  it("throws ConfigError for a cycle on both transports", async () => {
+    const cyc: Record<string, unknown> = { a: 1 };
+    cyc.self = cyc;
+    await expect(restInsert(cyc)).rejects.toBeInstanceOf(ConfigError);
+    expect(() => plain().insert({ meta: cyc }).toGraphql()).toThrow(ConfigError);
+    expect(() => plain().where({ m: { jsonContains: cyc } }).toGraphql()).toThrow(ConfigError);
+    expect(() => plain().via("rest").where({ m: { jsonContains: cyc } }).toRest()).toThrow(ConfigError);
+    const arr: unknown[] = [];
+    arr.push(arr);
+    expect(() => plain().insert({ meta: arr }).toGraphql()).toThrow(ConfigError);
+  });
+  it("throws ConfigError past depth 1000 on both transports, not a RangeError", async () => {
+    await expect(restInsert(nest(1001))).rejects.toBeInstanceOf(ConfigError);
+    expect(() => plain().insert({ meta: nest(1001) }).toGraphql()).toThrow(ConfigError);
+    expect(() => plain().insert({ meta: nest(900) }).toGraphql()).not.toThrow();
+  });
+});

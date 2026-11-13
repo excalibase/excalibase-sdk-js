@@ -72,18 +72,31 @@ function assertName(name: unknown, what: string): string {
   return name;
 }
 
-/** Walks a value fully: JSON serialization would turn a nested `undefined` into a missing key or `null`. */
-function assertDefined(value: unknown, what: string, depth = 0): void {
+const MAX_VALUE_DEPTH = 1000;
+
+/**
+ * Walks a value fully before it is serialized: a nested `undefined` would
+ * become a missing key or `null`, and a cycle or extreme depth would overflow
+ * the stack. Objects on the current path are tracked, so a shared reference
+ * that is not a cycle stays allowed.
+ */
+function assertDefined(value: unknown, what: string, depth = 0, path = new Set<object>()): void {
   if (value === undefined) {
     throw new ConfigError(`${what} contains undefined; use null for NULL or leave the key out`);
   }
-  if (depth > 32) throw new ConfigError(`${what} is nested too deeply`);
-  if (Array.isArray(value)) {
-    for (const item of value) assertDefined(item, what, depth + 1);
-  } else if (isForceQuoted(value) || isForceUnquoted(value)) {
-    assertDefined(value.value, what, depth + 1);
-  } else if (typeof value === "object" && value !== null) {
-    for (const item of Object.values(value)) assertDefined(item, what, depth + 1);
+  if (typeof value !== "object" || value === null) return;
+  if (depth >= MAX_VALUE_DEPTH) throw new ConfigError(`${what} is nested deeper than ${MAX_VALUE_DEPTH} levels`);
+  if (path.has(value)) throw new ConfigError(`${what} contains a circular reference`);
+  path.add(value);
+  try {
+    const children = Array.isArray(value)
+      ? value
+      : isForceQuoted(value) || isForceUnquoted(value)
+        ? [value.value]
+        : Object.values(value);
+    for (const child of children) assertDefined(child, what, depth + 1, path);
+  } finally {
+    path.delete(value);
   }
 }
 
@@ -149,6 +162,11 @@ function finiteNumber(n: number, what: string): string {
 }
 
 function serializeGraphqlValue(v: unknown): string {
+  assertDefined(v, "value");
+  return serializeChecked(v);
+}
+
+function serializeChecked(v: unknown): string {
   if (v === undefined) throw new ConfigError("undefined is not a valid value; use null for NULL or leave the key out");
   if (v === null) return "null";
   if (typeof v === "number") return finiteNumber(v, "filter value");
@@ -156,13 +174,13 @@ function serializeGraphqlValue(v: unknown): string {
   if (typeof v === "bigint") return v.toString();
   if (isForceQuoted(v)) return JSON.stringify(v.value);
   if (isForceUnquoted(v)) return assertEnumValue(v.value);
-  if (Array.isArray(v)) return `[${v.map(serializeGraphqlValue).join(", ")}]`;
+  if (Array.isArray(v)) return `[${v.map(serializeChecked).join(", ")}]`;
   if (typeof v === "string") {
     return ENUM_LIKE.test(v) && !KEYWORD_LITERALS.has(v) ? v : JSON.stringify(v);
   }
   if (typeof v === "object") {
     const entries = Object.entries(v as Record<string, unknown>).map(
-      ([k, val]) => `${assertName(k, "filter key")}: ${serializeGraphqlValue(val)}`,
+      ([k, val]) => `${assertName(k, "filter key")}: ${serializeChecked(val)}`,
     );
     return `{ ${entries.join(", ")} }`;
   }
