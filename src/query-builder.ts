@@ -72,6 +72,13 @@ function assertName(name: unknown, what: string): string {
   return name;
 }
 
+/** An enum value is a bare name, and `null`, `true` and `false` would read as keywords. */
+function assertEnumValue(value: unknown): string {
+  const name = assertName(value, "enum value");
+  if (KEYWORD_LITERALS.has(name)) throw new ConfigError(`Invalid enum value "${name}": reserved word`);
+  return name;
+}
+
 function assertWholeNumber(n: unknown, what: string): number {
   if (typeof n !== "number" || !Number.isInteger(n)) {
     throw new ConfigError(`${what} must be an integer`);
@@ -90,7 +97,7 @@ function serializeGraphqlValue(v: unknown): string {
   if (typeof v === "boolean") return String(v);
   if (typeof v === "bigint") return v.toString();
   if (isForceQuoted(v)) return JSON.stringify(v.value);
-  if (isForceUnquoted(v)) return assertName(v.value, "enum value");
+  if (isForceUnquoted(v)) return assertEnumValue(v.value);
   if (Array.isArray(v)) return `[${v.map(serializeGraphqlValue).join(", ")}]`;
   if (typeof v === "string") {
     return ENUM_LIKE.test(v) && !KEYWORD_LITERALS.has(v) ? v : JSON.stringify(v);
@@ -473,6 +480,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
       if (this._where == null) {
         throw new ConfigError(`update via REST on "${this.graphqlField}" requires a .where(...) filter`);
       }
+      assertNoRestOr(this._where, this._or);
       const qs = serializeRestWhere(this._where);
       const result = await this.db.rest.patch<{ data?: T[] } | T[]>(
         `/${this.rest.table}?${qs}`,
@@ -485,6 +493,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
       if (this._where == null) {
         throw new ConfigError(`delete via REST on "${this.graphqlField}" requires a .where(...) filter`);
       }
+      assertNoRestOr(this._where, this._or);
       const qs = serializeRestWhere(this._where);
       const result = await this.db.rest.delete<{ data?: T[] } | T[]>(
         `/${this.rest.table}?${qs}`,
@@ -546,10 +555,12 @@ export class QueryBuilder<T = Record<string, unknown>> {
     if (this.rest == null) {
       throw new ConfigError(`toRest() called without a REST descriptor on db.from("${this.graphqlField}")`);
     }
+    assertNoRestOr(this._where, this._or);
     const params = new URLSearchParams();
     if (this._select.length > 0) params.set("select", this._select.join(","));
     if (this._where != null) {
       for (const [col, ops] of Object.entries(this._where)) {
+        if (col === "_or") continue;
         for (const [op, value] of Object.entries(ops) as Array<[FilterOp, FilterValue]>) {
           params.append(col, serializeRestFilter(op, value));
         }
@@ -614,7 +625,7 @@ function serializeRecord(record: Record<string, unknown>, enumColumns?: readonly
   const entries = Object.entries(record).map(([col, value]) => {
     let serialized: string;
     if (enumSet.has(col) && typeof value === "string") {
-      serialized = assertName(value, "enum value");
+      serialized = assertEnumValue(value);
     } else if (schemaKnown && typeof value === "string" && !isForceQuoted(value) && !isForceUnquoted(value)) {
       serialized = JSON.stringify(value);
     } else {
@@ -632,15 +643,22 @@ function orderDirection(dir: unknown): string {
 }
 
 function serializeEnum(value: unknown): string {
-  if (typeof value === "string") return assertName(value, "enum value");
+  if (typeof value === "string") return assertEnumValue(value);
   if (Array.isArray(value)) return `[${value.map(serializeEnum).join(", ")}]`;
   return serializeGraphqlValue(value);
+}
+
+function assertNoRestOr(where: WhereInput | null, or: WhereInput[] | null): void {
+  const has = (list?: WhereInput[] | null) => list != null && list.length > 0;
+  if (has(or) || has(where?._or)) {
+    throw new ConfigError("REST cannot send an or-group; use the GraphQL transport for .or() and _or");
+  }
 }
 
 function serializeRestWhere(where: WhereInput): string {
   const params = new URLSearchParams();
   for (const [col, ops] of Object.entries(where)) {
-    if (col === "_or") continue; // _or has no PostgREST equivalent — skip
+    if (col === "_or") continue; // refused by assertNoRestOr before this runs
     for (const [op, value] of Object.entries(ops) as Array<[FilterOp, FilterValue]>) {
       if (op === "not") {
         // PostgREST negation: prefix each inner op with `not.`
@@ -670,7 +688,7 @@ function serializeRestFilter(op: FilterOp, value: FilterValue): string {
     case "in":
     case "notIn":
       if (!Array.isArray(v)) throw new ConfigError(`${op} expects an array value`);
-      return `${restOp(op)}.(${v.map(restListItem).join(",")})`;
+      return `${restOp(op)}.(${v.map(inListItem).join(",")})`;
     case "isNull":
       return v ? "is.null" : "not.is.null";
     case "isNotNull":
@@ -683,7 +701,7 @@ function serializeRestFilter(op: FilterOp, value: FilterValue): string {
     case "hasKeys":
     case "hasAnyKeys":
       if (!Array.isArray(v)) throw new ConfigError(`${op} expects an array value`);
-      return `${restOp(op)}.(${v.map(restListItem).join(",")})`;
+      return `${restOp(op)}.(${v.map(inListItem).join(",")})`;
     case "contains":
       return `ilike.%${escapeLike(String(v))}%`;
     case "jsonContains":
@@ -705,6 +723,16 @@ function restListItem(x: unknown): string {
   return `"${text.replace(/[\\"]/g, "\\$&")}"`;
 }
 
+/**
+ * The engine splits an `in.(...)` list on every comma and never strips quotes,
+ * so a value holding a comma would become extra members. Refuse it.
+ */
+function inListItem(x: unknown): string {
+  const text = String(x);
+  if (text.includes(",")) throw new ConfigError(`in/notIn values cannot contain a comma: "${text.slice(0, 40)}"`);
+  return text;
+}
+
 function escapeLike(text: string): string {
   return text.replace(/[\\%_]/g, "\\$&");
 }
@@ -720,8 +748,8 @@ function restOp(op: FilterOp): string {
     case "in": return "in";
     case "notIn": return "not.in";
     case "contains": return "ilike";
-    case "startsWith": return "like";
-    case "endsWith": return "like";
+    case "startsWith": return "startswith";
+    case "endsWith": return "endswith";
     case "like": return "like";
     case "ilike": return "ilike";
     case "isNull": return "is";
