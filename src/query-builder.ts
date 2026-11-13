@@ -358,7 +358,8 @@ export class QueryBuilder<T = Record<string, unknown>> {
     }
     // GraphQL: use the sibling <Field>Aggregate field with the same where.
     const aggregateField = `${assertName(this.graphqlField, "field name")}Aggregate`;
-    const whereClause = this._where != null ? `(where: ${this.serializeWhereTyped(this._where)})` : "";
+    const whereParts = this.buildWhereParts();
+    const whereClause = whereParts != null ? `(where: ${whereParts})` : "";
     const document = `{ ${aggregateField}${whereClause} { count } }`;
     const data = await this.db.graphql.query<Record<string, { count: number }>>(document);
     return data[aggregateField]?.count ?? 0;
@@ -559,12 +560,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
     const params = new URLSearchParams();
     if (this._select.length > 0) params.set("select", this._select.join(","));
     if (this._where != null) {
-      for (const [col, ops] of Object.entries(this._where)) {
-        if (col === "_or") continue;
-        for (const [op, value] of Object.entries(ops) as Array<[FilterOp, FilterValue]>) {
-          params.append(col, serializeRestFilter(op, value));
-        }
-      }
+      for (const [col, filter] of restFilterParams(this._where)) params.append(col, filter);
     }
     if (this._orderBy != null) {
       const parts = Object.entries(this._orderBy).map(([col, dir]) => `${col}.${String(dir).toLowerCase()}`);
@@ -587,6 +583,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
   private cloneForCount(): QueryBuilder<T> {
     const clone = new QueryBuilder<T>(this.db, this.graphqlField, this.rest, this.enumColumns);
     clone._where = this._where;
+    clone._or = this._or;
     clone._limit = 1;
     clone._offset = 0;
     clone._transport = this._transport;
@@ -655,23 +652,38 @@ function assertNoRestOr(where: WhereInput | null, or: WhereInput[] | null): void
   }
 }
 
-function serializeRestWhere(where: WhereInput): string {
-  const params = new URLSearchParams();
+/**
+ * Flattens a where into `[column, filter]` pairs. The engine's REST handlers
+ * keep one value per parameter name, so a second filter on the same column
+ * would be dropped and the call would match more rows than asked: refuse it.
+ */
+function restFilterParams(where: WhereInput): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [];
   for (const [col, ops] of Object.entries(where)) {
     if (col === "_or") continue; // refused by assertNoRestOr before this runs
+    const columnPairs: Array<[string, string]> = [];
     for (const [op, value] of Object.entries(ops) as Array<[FilterOp, FilterValue]>) {
       if (op === "not") {
-        // PostgREST negation: prefix each inner op with `not.`
         if (typeof value === "object" && value !== null && !Array.isArray(value)) {
           for (const [innerOp, innerVal] of Object.entries(value) as Array<[FilterOp, FilterValue]>) {
-            params.append(col, `not.${serializeRestFilter(innerOp, innerVal)}`);
+            columnPairs.push([col, `not.${serializeRestFilter(innerOp, innerVal)}`]);
           }
         }
         continue;
       }
-      params.append(col, serializeRestFilter(op, value));
+      columnPairs.push([col, serializeRestFilter(op, value)]);
     }
+    if (columnPairs.length > 1) {
+      throw new ConfigError(`REST can send only one filter per column; "${col}" has ${columnPairs.length}. Use the GraphQL transport.`);
+    }
+    pairs.push(...columnPairs);
   }
+  return pairs;
+}
+
+function serializeRestWhere(where: WhereInput): string {
+  const params = new URLSearchParams();
+  for (const [col, filter] of restFilterParams(where)) params.append(col, filter);
   return params.toString();
 }
 
@@ -688,6 +700,7 @@ function serializeRestFilter(op: FilterOp, value: FilterValue): string {
     case "in":
     case "notIn":
       if (!Array.isArray(v)) throw new ConfigError(`${op} expects an array value`);
+      if (v.length === 0) throw new ConfigError(`${op} over REST needs at least one value`);
       return `${restOp(op)}.(${v.map(inListItem).join(",")})`;
     case "isNull":
       return v ? "is.null" : "not.is.null";

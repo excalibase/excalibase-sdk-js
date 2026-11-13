@@ -209,3 +209,67 @@ describe("REST startsWith / endsWith", () => {
     expect(decodeURIComponent(plain().where({ n: { endsWith: "yz" } }).toRest().path)).toBe("/users?n=endswith.yz");
   });
 });
+
+describe("count() keeps or-groups", () => {
+  const orGroup = [{ id: { eq: 1 } }] as WhereInput[];
+  it("throws over REST like the other REST paths", async () => {
+    await expect(plain().via("rest").where({ t: { eq: 5 } }).or(orGroup).count()).rejects.toBeInstanceOf(ConfigError);
+  });
+  it("sends the or-group in the GraphQL aggregate", async () => {
+    const docs: string[] = [];
+    const db = createClient<any>({ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ...base,
+      fetch: (async (_u: RequestInfo | URL, init?: RequestInit) => {
+        docs.push(String(init?.body));
+        return new Response(JSON.stringify({ data: { usersAggregate: { count: 1 } } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+    });
+    await db.from("users").where({ t: { eq: 5 } }).or(orGroup).count();
+    expect(docs[0]).toContain("_or:");
+    expect(docs[0]).toContain("usersAggregate(where: { t: { eq: 5 }, _or: [{ id: { eq: 1 } }] })");
+  });
+});
+
+describe("REST sends at most one filter per column", () => {
+  const range = { created: { gte: "2026-01-01", lt: "2026-02-01" } };
+  it("throws for two operators on one column in reads", () => {
+    expect(() => plain().where(range).toRest()).toThrow(ConfigError);
+  });
+  it("throws for update, delete and count too, without sending a request", async () => {
+    const calls: string[] = [];
+    const db = createClient<any>({ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ...base,
+      fetch: (async (u: RequestInfo | URL) => {
+        calls.push(String(u));
+        return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+      }) as typeof fetch,
+    });
+    const q = () => db.from("users", { table: "users" }).via("rest");
+    await expect(q().delete().where(range).execute()).rejects.toBeInstanceOf(ConfigError);
+    await expect(q().update({ a: 1 }).where(range).execute()).rejects.toBeInstanceOf(ConfigError);
+    await expect(q().where(range).count()).rejects.toBeInstanceOf(ConfigError);
+    expect(calls).toHaveLength(0);
+  });
+  it("throws for several operators inside not", () => {
+    expect(() => plain().where({ c: { not: { eq: 1, gt: 5 } } }).toRest()).toThrow(ConfigError);
+  });
+  it("still allows one operator per column across many columns", () => {
+    expect(decodeURIComponent(plain().where({ a: { gte: 1 }, b: { lt: 2 } }).toRest().path)).toBe("/users?a=gte.1&b=lt.2");
+  });
+  it("is not applied to GraphQL, which sends one object per column", () => {
+    expect(plain().where(range).toGraphql().document).toContain("created: { gte:");
+  });
+});
+
+describe("REST reads handle not and empty lists", () => {
+  it("sends not as a not. prefix on reads", () => {
+    expect(decodeURIComponent(plain().where({ c: { not: { eq: 1 } } }).toRest().path)).toBe("/users?c=not.eq.1");
+  });
+  it("throws on empty in/notIn lists", () => {
+    expect(() => plain().where({ s: { in: [] } }).toRest()).toThrow(ConfigError);
+    expect(() => plain().where({ s: { notIn: [] } }).toRest()).toThrow(ConfigError);
+  });
+});

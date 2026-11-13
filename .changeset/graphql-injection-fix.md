@@ -9,5 +9,7 @@ REST changes, some of which can change which rows a call touches:
 - `startsWith` and `endsWith` now use the engine's `startswith` and `endswith` operators. Before, they sent `like.value` with no wildcard, which matched only the exact value, so they now match more rows too.
 - `in`, `notIn` and `hasKeys` values containing a comma now throw a `ConfigError`, because the engine would split them into extra values. `arrayContains`, `arrayHasAll` and `arrayHasAny` quote values that hold commas, brackets, quotes or spaces.
 - `.or()` and `_or` throw a `ConfigError` over REST instead of being dropped silently, which used to make REST reads, updates and deletes match more rows than asked. Use the GraphQL transport for or-groups.
+- REST throws a `ConfigError` when one column has more than one filter (for example `created: { gte, lt }`, or several operators inside `not`), because the engine keeps only the first value per parameter and a range update or delete would match more rows than asked. Use the GraphQL transport for ranges. An empty `in` or `notIn` list also throws over REST, and REST reads now send `not` correctly.
+- `count()` now includes `.or()` conditions over GraphQL (it used to drop them) and throws over REST like the other REST calls.
 
 The README now says sessions are kept in `localStorage` by default and shows `memoryStorageAdapter()` as the alternative.
