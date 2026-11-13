@@ -125,7 +125,8 @@ function finiteNumber(n: number, what: string): string {
 }
 
 function serializeGraphqlValue(v: unknown): string {
-  if (v === null || v === undefined) return "null";
+  if (v === undefined) throw new ConfigError("undefined is not a valid value; use null for NULL or leave the key out");
+  if (v === null) return "null";
   if (typeof v === "number") return finiteNumber(v, "filter value");
   if (typeof v === "boolean") return String(v);
   if (typeof v === "bigint") return v.toString();
@@ -373,8 +374,10 @@ export class QueryBuilder<T = Record<string, unknown>> {
   }
 
   async first(): Promise<T | null> {
-    this._limit = 1;
-    const rows = await this.all();
+    // Work on a copy so the caller's builder keeps its own limit.
+    const copy: QueryBuilder<T> = Object.assign(Object.create(Object.getPrototypeOf(this)), this);
+    copy._limit = 1;
+    const rows = await copy.all();
     return rows[0] ?? null;
   }
 
@@ -489,7 +492,9 @@ export class QueryBuilder<T = Record<string, unknown>> {
       if (whereParts == null) {
         throw new ConfigError(`update on "${this.graphqlField}" requires a .where(...) filter (refusing unfiltered update)`);
       }
-      args = `where: ${whereParts}, input: ${serializeRecord(this._updatePatch ?? {}, this.enumColumns)}`;
+      const patch = serializeRecord(this._updatePatch ?? {}, this.enumColumns);
+      if (patch === "{  }") throw new ConfigError(`update on "${this.graphqlField}" has no values to set`);
+      args = `where: ${whereParts}, input: ${patch}`;
     } else if (this._mutationKind === "delete") {
       const whereParts = this.buildWhereParts();
       if (whereParts == null) {
@@ -520,6 +525,9 @@ export class QueryBuilder<T = Record<string, unknown>> {
       throw new ConfigError(`REST mutation on "${this.graphqlField}" needs a REST descriptor`);
     }
     this.assertMutationModifiers();
+    if (this._returning.length > 0) {
+      throw new ConfigError("returning() is not supported over REST writes; use the GraphQL transport");
+    }
     if (this._mutationKind === "insert") {
       const rows = this._insertRows ?? [];
       const body = rows.length === 1 ? rows[0] : rows;
@@ -537,6 +545,9 @@ export class QueryBuilder<T = Record<string, unknown>> {
       assertNoRestOr(this._where, this._or);
       const qs = serializeRestWhere(this._where);
       if (qs === "") throw new ConfigError(`${this._mutationKind} via REST on "${this.graphqlField}" needs a non-empty filter`);
+      if (Object.values(this._updatePatch ?? {}).every((v) => v === undefined)) {
+        throw new ConfigError(`update on "${this.graphqlField}" has no values to set`);
+      }
       const result = await this.db.rest.patch<{ data?: T[] } | T[]>(
         `/${this.rest.table}?${qs}`,
         this._updatePatch ?? {},
@@ -675,7 +686,7 @@ function serializeVectorInput(v: VectorSearchInput): string {
 function serializeRecord(record: Record<string, unknown>, enumColumns?: readonly string[]): string {
   const enumSet = new Set(enumColumns ?? []);
   const schemaKnown = enumColumns !== undefined;
-  const entries = Object.entries(record).map(([col, value]) => {
+  const entries = Object.entries(record).filter(([, value]) => value !== undefined).map(([col, value]) => {
     let serialized: string;
     if (enumSet.has(col) && typeof value === "string") {
       serialized = assertEnumValue(value);
@@ -752,6 +763,9 @@ function serializeOrderBy(spec: OrderBySpec): string {
 
 function serializeRestFilter(op: FilterOp, value: FilterValue): string {
   const v = extractRaw(value);
+  if (v === undefined || (Array.isArray(v) && v.includes(undefined as never))) {
+    throw new ConfigError(`${op} filter value is undefined; use null for NULL or leave the filter out`);
+  }
   switch (op) {
     case "in":
     case "notIn":

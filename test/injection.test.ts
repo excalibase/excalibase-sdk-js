@@ -392,3 +392,77 @@ describe("nothing is dropped: every combination", () => {
     }
   }
 });
+
+describe("first() leaves the builder unchanged", () => {
+  it("lets count() run after first() on the same builder", async () => {
+    const db = createClient<any>({ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ...base,
+      fetch: (async () =>
+        new Response(JSON.stringify({ data: { users: [], usersAggregate: { count: 3 } } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        })) as typeof fetch,
+    });
+    const q = db.from("users").where({ t: { eq: 5 } });
+    await q.first();
+    await expect(q.count()).resolves.toBe(3);
+    expect(q.toGraphql().document).not.toContain("limit");
+  });
+});
+
+describe("undefined is never turned into null", () => {
+  const asRest = () => plain().via("rest");
+  it("throws on undefined anywhere in a filter, on both transports", () => {
+    expect(() => plain().where({ owner: { eq: undefined } } as never).toGraphql()).toThrow(ConfigError);
+    expect(() => typed().where({ status: { eq: undefined } } as never).toGraphql()).toThrow(ConfigError);
+    expect(() => plain().where({ owner: { in: [1, undefined] } } as never).toGraphql()).toThrow(ConfigError);
+    expect(() => plain().where({ owner: { not: { eq: undefined } } } as never).toGraphql()).toThrow(ConfigError);
+    expect(() => asRest().where({ owner: { eq: undefined } } as never).toRest()).toThrow(ConfigError);
+    expect(() => asRest().where({ owner: { in: [1, undefined] } } as never).toRest()).toThrow(ConfigError);
+    expect(() => asRest().where({ owner: { not: { eq: undefined } } } as never).toRest()).toThrow(ConfigError);
+  });
+  it("keeps an explicit null meaning IS NULL", () => {
+    expect(plain().where({ owner: { eq: null } }).toGraphql().document).toContain("owner: { eq: null }");
+  });
+  it("drops undefined keys from insert and update rows on GraphQL, like REST does", () => {
+    expect(plain().insert({ name: undefined, a: 1 }).toGraphql().document).toBe(
+      "mutation { createUsers(input: { a: 1 }) { __typename } }",
+    );
+    expect(plain().insert([{ name: undefined, a: 1 }, { a: 2 }]).toGraphql().document).toContain("inputs: [{ a: 1 }, { a: 2 }]");
+    expect(plain().update({ name: undefined, a: 1 }).where({ id: { eq: 1 } }).toGraphql().document).toContain("input: { a: 1 }");
+  });
+  it("sends REST bodies without undefined keys", async () => {
+    const bodies: string[] = [];
+    const db = createClient<any>({ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ...base,
+      fetch: (async (_u: RequestInfo | URL, init?: RequestInit) => {
+        bodies.push(String(init?.body));
+        return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+      }) as typeof fetch,
+    });
+    await db.from("users", { table: "users" }).via("rest").insert({ name: undefined, a: 1 }).execute();
+    expect(JSON.parse(bodies[0]!)).toEqual({ a: 1 });
+  });
+  it("throws when an update has no defined values", () => {
+    expect(() => plain().update({ name: undefined }).where({ id: { eq: 1 } }).toGraphql()).toThrow(ConfigError);
+  });
+});
+
+describe("REST returning()", () => {
+  it("throws and points to the GraphQL transport", async () => {
+    const calls: string[] = [];
+    const db = createClient<any>({ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ...base,
+      fetch: (async (u: RequestInfo | URL) => {
+        calls.push(String(u));
+        return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+      }) as typeof fetch,
+    });
+    const q = db.from("users", { table: "users" }).via("rest").insert({ a: 1 }).returning("id");
+    await expect(q.execute()).rejects.toThrow(/GraphQL/);
+    expect(calls).toHaveLength(0);
+  });
+  it("still works over GraphQL", () => {
+    expect(plain().insert({ a: 1 }).returning("id").toGraphql().document).toContain("{ id }");
+  });
+});
