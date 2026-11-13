@@ -56,23 +56,56 @@ function isForceUnquoted(v: unknown): v is ForceUnquoted {
 }
 
 const ENUM_LIKE = /^[a-z_][a-z0-9_]*$/;
+const GRAPHQL_NAME = /^[_A-Za-z][_0-9A-Za-z]*$/;
+const KEYWORD_LITERALS = new Set(["true", "false", "null"]);
+
+/**
+ * Every field, column, operator and enum name is written into the query text,
+ * so each one must be a plain GraphQL name. Anything else throws before a
+ * request is built.
+ */
+function assertName(name: unknown, what: string): string {
+  if (typeof name !== "string" || !GRAPHQL_NAME.test(name)) {
+    const shown = String(name).length > 40 ? `${String(name).slice(0, 40)}...` : String(name);
+    throw new ConfigError(`Invalid ${what} "${shown}": must match ${GRAPHQL_NAME.source}`);
+  }
+  return name;
+}
+
+function assertWholeNumber(n: unknown, what: string): number {
+  if (typeof n !== "number" || !Number.isInteger(n)) {
+    throw new ConfigError(`${what} must be an integer`);
+  }
+  return n;
+}
+
+function finiteNumber(n: number, what: string): string {
+  if (!Number.isFinite(n)) throw new ConfigError(`${what} must be a finite number`);
+  return String(n);
+}
 
 function serializeGraphqlValue(v: unknown): string {
   if (v === null || v === undefined) return "null";
-  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (typeof v === "number") return finiteNumber(v, "filter value");
+  if (typeof v === "boolean") return String(v);
+  if (typeof v === "bigint") return v.toString();
   if (isForceQuoted(v)) return JSON.stringify(v.value);
-  if (isForceUnquoted(v)) return v.value;
+  if (isForceUnquoted(v)) return assertName(v.value, "enum value");
   if (Array.isArray(v)) return `[${v.map(serializeGraphqlValue).join(", ")}]`;
   if (typeof v === "string") {
-    return ENUM_LIKE.test(v) ? v : JSON.stringify(v);
+    return ENUM_LIKE.test(v) && !KEYWORD_LITERALS.has(v) ? v : JSON.stringify(v);
   }
   if (typeof v === "object") {
     const entries = Object.entries(v as Record<string, unknown>).map(
-      ([k, val]) => `${k}: ${serializeGraphqlValue(val)}`,
+      ([k, val]) => `${assertName(k, "filter key")}: ${serializeGraphqlValue(val)}`,
     );
     return `{ ${entries.join(", ")} }`;
   }
-  return JSON.stringify(v);
+  throw new ConfigError(`Unsupported value of type ${typeof v}`);
+}
+
+function projectionOf(columns: readonly string[]): string {
+  return columns.map((c) => assertName(c, "column")).join(" ");
 }
 
 // ---------- Types ----------
@@ -317,7 +350,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
       return response.pagination?.total ?? 0;
     }
     // GraphQL: use the sibling <Field>Aggregate field with the same where.
-    const aggregateField = `${this.graphqlField}Aggregate`;
+    const aggregateField = `${assertName(this.graphqlField, "field name")}Aggregate`;
     const whereClause = this._where != null ? `(where: ${this.serializeWhereTyped(this._where)})` : "";
     const document = `{ ${aggregateField}${whereClause} { count } }`;
     const data = await this.db.graphql.query<Record<string, { count: number }>>(document);
@@ -330,16 +363,17 @@ export class QueryBuilder<T = Record<string, unknown>> {
     if (this._mutationKind != null) return this.toGraphqlMutation();
     if (this._aggregate != null) return this.toGraphqlAggregate();
 
+    const field = assertName(this.graphqlField, "field name");
     const args: string[] = [];
     const whereParts = this.buildWhereParts();
     if (whereParts != null) args.push(`where: ${whereParts}`);
     if (this._vector != null) args.push(`vector: ${serializeVectorInput(this._vector)}`);
     if (this._orderBy != null) args.push(`orderBy: ${serializeOrderBy(this._orderBy)}`);
-    if (this._limit != null) args.push(`limit: ${this._limit}`);
-    if (this._offset != null) args.push(`offset: ${this._offset}`);
+    if (this._limit != null) args.push(`limit: ${assertWholeNumber(this._limit, "limit")}`);
+    if (this._offset != null) args.push(`offset: ${assertWholeNumber(this._offset, "offset")}`);
     const argString = args.length > 0 ? `(${args.join(", ")})` : "";
-    const projection = this._select.length > 0 ? this._select.join(" ") : "__typename";
-    const document = `{ ${this.graphqlField}${argString} { ${projection} } }`;
+    const projection = this._select.length > 0 ? projectionOf(this._select) : "__typename";
+    const document = `{ ${field}${argString} { ${projection} } }`;
     return { document };
   }
 
@@ -350,12 +384,12 @@ export class QueryBuilder<T = Record<string, unknown>> {
     for (const fn of ["sum", "avg", "min", "max"] as const) {
       const cols = agg[fn];
       if (cols != null && cols.length > 0) {
-        parts.push(`${fn} { ${cols.join(" ")} }`);
+        parts.push(`${fn} { ${projectionOf(cols)} }`);
       }
     }
     const whereParts = this.buildWhereParts();
     const whereArg = whereParts != null ? `(where: ${whereParts})` : "";
-    const document = `{ ${this.graphqlField}Aggregate${whereArg} { ${parts.join(" ")} } }`;
+    const document = `{ ${assertName(this.graphqlField, "field name")}Aggregate${whereArg} { ${parts.join(" ")} } }`;
     return { document };
   }
 
@@ -381,7 +415,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
   }
 
   private toGraphqlMutation(): { document: string } {
-    const projection = this._returning.length > 0 ? this._returning.join(" ") : "__typename";
+    const projection = this._returning.length > 0 ? projectionOf(this._returning) : "__typename";
     const field = this.graphqlMutationField();
     let args = "";
     if (this._mutationKind === "insert") {
@@ -411,7 +445,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
     // GraphQL field names follow the same Capitalize convention used by the
     // server: `kanbanIssues` → `createKanbanIssues` / `updateKanbanIssues` /
     // `deleteKanbanIssues`. Bulk insert uses `createMany<Type>`.
-    const cap = this.graphqlField.charAt(0).toUpperCase() + this.graphqlField.slice(1);
+    const cap = assertName(this.graphqlField, "field name").charAt(0).toUpperCase() + this.graphqlField.slice(1);
     if (this._mutationKind === "insert") {
       const isBulk = (this._insertRows?.length ?? 0) > 1;
       return isBulk ? `createMany${cap}` : `create${cap}`;
@@ -491,17 +525,17 @@ export class QueryBuilder<T = Record<string, unknown>> {
       // "not" wraps a nested ColumnFilter
       if (op === "not" && typeof value === "object" && value !== null && !Array.isArray(value)) {
         const inner = Object.entries(value as Record<string, unknown>)
-          .map(([k, v]) => `${k}: ${this.serializeValue(col, v, isEnum, schemaKnown)}`)
+          .map(([k, v]) => `${assertName(k, "operator")}: ${this.serializeValue(col, v, isEnum, schemaKnown)}`)
           .join(", ");
         return `not: { ${inner} }`;
       }
-      return `${op}: ${this.serializeValue(col, value, isEnum, schemaKnown)}`;
+      return `${assertName(op, "operator")}: ${this.serializeValue(col, value, isEnum, schemaKnown)}`;
     });
-    return `${col}: { ${opEntries.join(", ")} }`;
+    return `${assertName(col, "column")}: { ${opEntries.join(", ")} }`;
   }
 
   private serializeValue(_col: string, value: unknown, isEnum: boolean, schemaKnown: boolean): string {
-    if (isEnum && typeof value === "string") return value;
+    if (isEnum) return serializeEnum(value);
     if (schemaKnown && typeof value === "string" && !isForceQuoted(value) && !isForceUnquoted(value)) {
       return JSON.stringify(value);
     }
@@ -556,12 +590,21 @@ export class QueryBuilder<T = Record<string, unknown>> {
  * are emitted as bare GraphQL identifiers; everything else uses
  * {@link serializeGraphqlValue} which keeps strings quoted.
  */
+const VECTOR_DISTANCES = new Set(["L2", "COSINE", "IP"]);
+
+function badVector(): never {
+  throw new ConfigError("vector near must be an array of numbers");
+}
+
 function serializeVectorInput(v: VectorSearchInput): string {
   const parts: string[] = [];
-  parts.push(`column: "${v.column}"`);
-  parts.push(`near: [${v.near.join(", ")}]`);
-  if (v.distance != null) parts.push(`distance: ${v.distance}`);
-  if (v.limit != null) parts.push(`limit: ${v.limit}`);
+  parts.push(`column: ${JSON.stringify(String(v.column))}`);
+  parts.push(`near: [${v.near.map((n) => (typeof n === "number" ? finiteNumber(n, "vector component") : badVector())).join(", ")}]`);
+  if (v.distance != null) {
+    if (!VECTOR_DISTANCES.has(v.distance)) throw new ConfigError("vector distance must be L2, COSINE or IP");
+    parts.push(`distance: ${v.distance}`);
+  }
+  if (v.limit != null) parts.push(`limit: ${assertWholeNumber(v.limit, "vector limit")}`);
   return `{ ${parts.join(", ")} }`;
 }
 
@@ -571,15 +614,27 @@ function serializeRecord(record: Record<string, unknown>, enumColumns?: readonly
   const entries = Object.entries(record).map(([col, value]) => {
     let serialized: string;
     if (enumSet.has(col) && typeof value === "string") {
-      serialized = value;
+      serialized = assertName(value, "enum value");
     } else if (schemaKnown && typeof value === "string" && !isForceQuoted(value) && !isForceUnquoted(value)) {
       serialized = JSON.stringify(value);
     } else {
       serialized = serializeGraphqlValue(value);
     }
-    return `${col}: ${serialized}`;
+    return `${assertName(col, "column")}: ${serialized}`;
   });
   return `{ ${entries.join(", ")} }`;
+}
+
+function orderDirection(dir: unknown): string {
+  const upper = String(dir).toUpperCase();
+  if (upper !== "ASC" && upper !== "DESC") throw new ConfigError(`orderBy direction must be asc or desc`);
+  return upper;
+}
+
+function serializeEnum(value: unknown): string {
+  if (typeof value === "string") return assertName(value, "enum value");
+  if (Array.isArray(value)) return `[${value.map(serializeEnum).join(", ")}]`;
+  return serializeGraphqlValue(value);
 }
 
 function serializeRestWhere(where: WhereInput): string {
@@ -603,7 +658,9 @@ function serializeRestWhere(where: WhereInput): string {
 }
 
 function serializeOrderBy(spec: OrderBySpec): string {
-  const entries = Object.entries(spec).map(([col, dir]) => `${col}: ${String(dir).toUpperCase()}`);
+  const entries = Object.entries(spec).map(
+    ([col, dir]) => `${assertName(col, "orderBy column")}: ${orderDirection(dir)}`,
+  );
   return `{ ${entries.join(", ")} }`;
 }
 
@@ -613,7 +670,7 @@ function serializeRestFilter(op: FilterOp, value: FilterValue): string {
     case "in":
     case "notIn":
       if (!Array.isArray(v)) throw new ConfigError(`${op} expects an array value`);
-      return `${restOp(op)}.(${v.map((x) => String(x)).join(",")})`;
+      return `${restOp(op)}.(${v.map(restListItem).join(",")})`;
     case "isNull":
       return v ? "is.null" : "not.is.null";
     case "isNotNull":
@@ -622,17 +679,34 @@ function serializeRestFilter(op: FilterOp, value: FilterValue): string {
     case "arrayHasAll":
     case "arrayHasAny":
       if (!Array.isArray(v)) throw new ConfigError(`${op} expects an array value`);
-      return `${restOp(op)}.{${v.map((x) => String(x)).join(",")}}`;
+      return `${restOp(op)}.{${v.map(restListItem).join(",")}}`;
     case "hasKeys":
     case "hasAnyKeys":
       if (!Array.isArray(v)) throw new ConfigError(`${op} expects an array value`);
-      return `${restOp(op)}.(${v.map((x) => String(x)).join(",")})`;
+      return `${restOp(op)}.(${v.map(restListItem).join(",")})`;
+    case "contains":
+      return `ilike.%${escapeLike(String(v))}%`;
     case "jsonContains":
     case "containedBy":
       return `${restOp(op)}.${typeof v === "object" ? JSON.stringify(v) : String(v)}`;
     default:
       return `${restOp(op)}.${String(v)}`;
   }
+}
+
+/**
+ * One member of a PostgREST list (`in.(...)`, `cs.{...}`). A value holding a
+ * separator, bracket, quote, backslash or whitespace is double-quoted with
+ * `"` and `\\` escaped, so it stays one member and cannot add filters.
+ */
+function restListItem(x: unknown): string {
+  const text = String(x);
+  if (text !== "" && !/[,()"\\{}\s]/.test(text)) return text;
+  return `"${text.replace(/[\\"]/g, "\\$&")}"`;
+}
+
+function escapeLike(text: string): string {
+  return text.replace(/[\\%_]/g, "\\$&");
 }
 
 function restOp(op: FilterOp): string {
