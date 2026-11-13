@@ -466,3 +466,33 @@ describe("REST returning()", () => {
     expect(plain().insert({ a: 1 }).returning("id").toGraphql().document).toContain("{ id }");
   });
 });
+
+describe("REST rejects undefined nested inside values", () => {
+  const asRest = () => plain().via("rest");
+  it("throws for nested undefined in filter values", () => {
+    expect(() => asRest().where({ m: { jsonContains: { tenant: undefined } } } as never).toRest()).toThrow(ConfigError);
+    expect(() => asRest().where({ m: { containedBy: { a: [undefined] } } } as never).toRest()).toThrow(ConfigError);
+    expect(() => asRest().where({ t: { arrayContains: [[undefined]] } } as never).toRest()).toThrow(ConfigError);
+    expect(() => asRest().where({ m: { not: { jsonContains: { a: { b: undefined } } } } } as never).toRest()).toThrow(ConfigError);
+  });
+  it("still sends fully defined JSON filter values", () => {
+    expect(decodeURIComponent(asRest().where({ m: { jsonContains: { a: [1, null] } } }).toRest().path)).toBe(
+      '/users?m=jsoncontains.{"a":[1,null]}',
+    );
+  });
+  it("throws for nested undefined in REST insert and update bodies, without sending", async () => {
+    const calls: string[] = [];
+    const db = createClient<any>({ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ...base,
+      fetch: (async (u: RequestInfo | URL) => {
+        calls.push(String(u));
+        return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+      }) as typeof fetch,
+    });
+    const q = () => db.from("users", { table: "users" }).via("rest");
+    await expect(q().update({ meta: { a: undefined } }).where({ id: { eq: 1 } }).execute()).rejects.toBeInstanceOf(ConfigError);
+    await expect(q().insert({ meta: [undefined] }).execute()).rejects.toBeInstanceOf(ConfigError);
+    await expect(q().insert([{ a: 1 }, { meta: { b: undefined } }]).execute()).rejects.toBeInstanceOf(ConfigError);
+    expect(calls).toHaveLength(0);
+  });
+});

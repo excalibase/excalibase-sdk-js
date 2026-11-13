@@ -72,6 +72,30 @@ function assertName(name: unknown, what: string): string {
   return name;
 }
 
+/** Walks a value fully: JSON serialization would turn a nested `undefined` into a missing key or `null`. */
+function assertDefined(value: unknown, what: string, depth = 0): void {
+  if (value === undefined) {
+    throw new ConfigError(`${what} contains undefined; use null for NULL or leave the key out`);
+  }
+  if (depth > 32) throw new ConfigError(`${what} is nested too deeply`);
+  if (Array.isArray(value)) {
+    for (const item of value) assertDefined(item, what, depth + 1);
+  } else if (isForceQuoted(value) || isForceUnquoted(value)) {
+    assertDefined(value.value, what, depth + 1);
+  } else if (typeof value === "object" && value !== null) {
+    for (const item of Object.values(value)) assertDefined(item, what, depth + 1);
+  }
+}
+
+/** Top-level undefined keys are dropped (as on GraphQL); nested ones are refused. */
+function assertRowsDefined(rows: ReadonlyArray<Record<string, unknown>>): void {
+  for (const row of rows) {
+    for (const [key, value] of Object.entries(row)) {
+      if (value !== undefined) assertDefined(value, `column "${key}"`);
+    }
+  }
+}
+
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -530,6 +554,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
     }
     if (this._mutationKind === "insert") {
       const rows = this._insertRows ?? [];
+      assertRowsDefined(rows as ReadonlyArray<Record<string, unknown>>);
       const body = rows.length === 1 ? rows[0] : rows;
       const result = await this.db.rest.post<{ data?: T[] } | T[]>(
         `/${this.rest.table}`,
@@ -545,6 +570,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
       assertNoRestOr(this._where, this._or);
       const qs = serializeRestWhere(this._where);
       if (qs === "") throw new ConfigError(`${this._mutationKind} via REST on "${this.graphqlField}" needs a non-empty filter`);
+      assertRowsDefined([(this._updatePatch ?? {}) as Record<string, unknown>]);
       if (Object.values(this._updatePatch ?? {}).every((v) => v === undefined)) {
         throw new ConfigError(`update on "${this.graphqlField}" has no values to set`);
       }
@@ -763,9 +789,7 @@ function serializeOrderBy(spec: OrderBySpec): string {
 
 function serializeRestFilter(op: FilterOp, value: FilterValue): string {
   const v = extractRaw(value);
-  if (v === undefined || (Array.isArray(v) && v.includes(undefined as never))) {
-    throw new ConfigError(`${op} filter value is undefined; use null for NULL or leave the filter out`);
-  }
+  assertDefined(v, `${op} filter value`);
   switch (op) {
     case "in":
     case "notIn":
