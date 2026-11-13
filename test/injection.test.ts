@@ -273,3 +273,122 @@ describe("REST reads handle not and empty lists", () => {
     expect(() => plain().where({ s: { notIn: [] } }).toRest()).toThrow(ConfigError);
   });
 });
+
+describe("nothing is dropped: specific cases", () => {
+  const asRest = () => plain().via("rest");
+  it("GraphQL update and delete send .or() and refuse an empty filter", () => {
+    const orGroup = [{ id: { eq: 1 } }] as WhereInput[];
+    expect(plain().delete().where({ t: { eq: 5 } }).or(orGroup).toGraphql().document).toBe(
+      "mutation { deleteUsers(where: { t: { eq: 5 }, _or: [{ id: { eq: 1 } }] }) { __typename } }",
+    );
+    expect(plain().update({ a: 1 }).where({ t: { eq: 5 } }).or(orGroup).toGraphql().document).toContain("_or: [");
+    expect(() => plain().delete().where({}).toGraphql()).toThrow(ConfigError);
+    expect(() => plain().update({ a: 1 }).where({}).toGraphql()).toThrow(ConfigError);
+    expect(() => plain().delete().toGraphql()).toThrow(ConfigError);
+  });
+  it("REST update and delete refuse an empty filter", async () => {
+    await expect(asRest().delete().where({}).execute()).rejects.toBeInstanceOf(ConfigError);
+    await expect(asRest().update({ a: 1 }).where({}).execute()).rejects.toBeInstanceOf(ConfigError);
+  });
+  it("throws when not is not an object with an operator", () => {
+    for (const bad of [9, "x", null, [], {}]) {
+      expect(() => asRest().where({ c: { not: bad } } as never).toRest()).toThrow(ConfigError);
+      expect(() => plain().where({ c: { not: bad } } as never).toGraphql()).toThrow(ConfigError);
+    }
+  });
+  it("throws on empty or non-object column filters on both transports", () => {
+    for (const bad of [{}, 5, "x", null, []]) {
+      expect(() => asRest().where({ c: bad } as never).toRest()).toThrow(ConfigError);
+      expect(() => plain().where({ c: bad } as never).toGraphql()).toThrow(ConfigError);
+    }
+  });
+  it("throws when _or is not a non-empty array of filters", () => {
+    for (const bad of [5, "x", {}, [], [5], [{}]]) {
+      expect(() => plain().where({ t: { eq: 1 }, _or: bad } as never).toGraphql()).toThrow(ConfigError);
+      expect(() => plain().where({ t: { eq: 1 } }).or(bad as never).toGraphql()).toThrow(ConfigError);
+      expect(() => asRest().where({ t: { eq: 1 }, _or: bad } as never).toRest()).toThrow(ConfigError);
+    }
+  });
+  it("throws when both where._or and .or() are given", () => {
+    const orGroup = [{ id: { eq: 1 } }] as WhereInput[];
+    expect(() => plain().where({ t: { eq: 1 }, _or: orGroup } as never).or(orGroup).toGraphql()).toThrow(ConfigError);
+  });
+  it("throws for vector or aggregate over REST", () => {
+    expect(() => asRest().vector({ column: "e", near: [1] }).toRest()).toThrow(ConfigError);
+    expect(() => asRest().aggregate({ count: true }).toRest()).toThrow(ConfigError);
+  });
+  it("throws for vector combined with aggregate on GraphQL", () => {
+    expect(() => plain().vector({ column: "e", near: [1] }).aggregate({ count: true }).toGraphql()).toThrow(ConfigError);
+  });
+});
+
+/**
+ * Every combination of condition-like modifiers, per transport and per kind of
+ * call. The rule: each modifier that was set shows up in what is sent, or the
+ * call throws. It is never silently dropped.
+ */
+describe("nothing is dropped: every combination", () => {
+  type Mod = "where" | "or" | "orderBy" | "limit" | "offset" | "vector" | "aggregate";
+  const MODS: Mod[] = ["where", "or", "orderBy", "limit", "offset", "vector", "aggregate"];
+  type Kind = "read" | "count" | "insert" | "update" | "delete";
+  const KINDS: Kind[] = ["read", "count", "insert", "update", "delete"];
+  const EVIDENCE: Record<Mod, RegExp> = {
+    where: /wcol/,
+    or: /ocol/,
+    orderBy: /ordcol/,
+    limit: /limit[:=] ?77/,
+    offset: /offset[:=] ?88/,
+    vector: /vector:/,
+    aggregate: /sum \{ amt \}/,
+  };
+
+  async function run(transport: "graphql" | "rest", kind: Kind, mods: Set<Mod>): Promise<string | "threw"> {
+    const sent: string[] = [];
+    const db = createClient<any>({ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ...base,
+      fetch: (async (u: RequestInfo | URL, init?: RequestInit) => {
+        sent.push(`${String(u)} ${String(init?.body ?? "")}`);
+        return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "content-type": "application/json" } });
+      }) as typeof fetch,
+    });
+    let b = db.from("users", { table: "users" }).via(transport);
+    if (kind === "insert") b = b.insert({ a: 1 });
+    if (kind === "update") b = b.update({ a: 1 });
+    if (kind === "delete") b = b.delete();
+    if (mods.has("where") || kind === "update" || kind === "delete") b = b.where({ wcol: { eq: 5 } });
+    if (mods.has("or")) b = b.or([{ ocol: { eq: 1 } }] as WhereInput[]);
+    if (mods.has("orderBy")) b = b.orderBy({ ordcol: "asc" });
+    if (mods.has("limit")) b = b.limit(77);
+    if (mods.has("offset")) b = b.offset(88);
+    if (mods.has("vector")) b = b.vector({ column: "e", near: [1] });
+    if (mods.has("aggregate")) b = b.aggregate({ sum: ["amt"] });
+    try {
+      if (kind === "read") await b.all();
+      else if (kind === "count") await b.count();
+      else await b.execute();
+    } catch (e) {
+      if (e instanceof ConfigError) return "threw";
+      throw e;
+    }
+    return decodeURIComponent(sent.join("\n").replace(/\+/g, " "));
+  }
+
+  for (const transport of ["graphql", "rest"] as const) {
+    for (const kind of KINDS) {
+      it(`${transport} ${kind}: every set modifier is sent or the call throws`, async () => {
+        const failures: string[] = [];
+        for (let mask = 0; mask < 1 << MODS.length; mask++) {
+          const mods = new Set(MODS.filter((_, i) => mask & (1 << i)));
+          const out = await run(transport, kind, mods);
+          if (out === "threw") continue;
+          const required = new Set(mods);
+          if (kind === "update" || kind === "delete") required.add("where");
+          for (const m of required) {
+            if (!EVIDENCE[m].test(out)) failures.push(`${[...mods].join("+") || "(none)"}: ${m} dropped`);
+          }
+        }
+        expect(failures).toEqual([]);
+      });
+    }
+  }
+});

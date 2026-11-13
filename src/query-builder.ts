@@ -72,6 +72,39 @@ function assertName(name: unknown, what: string): string {
   return name;
 }
 
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function validateColumnFilter(col: string, ops: unknown): void {
+  if (!isPlainObject(ops) || Object.keys(ops).length === 0) {
+    throw new ConfigError(`Filter on "${col}" must be an object with at least one operator`);
+  }
+  if ("not" in ops) {
+    const inner = ops.not;
+    if (!isPlainObject(inner) || Object.keys(inner).length === 0 || "not" in inner) {
+      throw new ConfigError(`"not" on "${col}" must be an object with at least one operator and no nested "not"`);
+    }
+  }
+}
+
+function validateOrList(list: unknown): void {
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new ConfigError("_or / .or() must be a non-empty array of filters");
+  }
+  for (const condition of list) validateWhere(condition, true);
+}
+
+/** Every part of a where is sent or refused, never dropped. */
+function validateWhere(where: unknown, requireColumns = false): void {
+  if (!isPlainObject(where)) throw new ConfigError("A where filter must be an object");
+  for (const [col, ops] of Object.entries(where)) {
+    if (col === "_or") validateOrList(ops);
+    else validateColumnFilter(col, ops);
+  }
+  if (requireColumns && Object.keys(where).length === 0) throw new ConfigError("An _or condition cannot be empty");
+}
+
 /** An enum value is a bare name, and `null`, `true` and `false` would read as keywords. */
 function assertEnumValue(value: unknown): string {
   const name = assertName(value, "enum value");
@@ -183,6 +216,8 @@ export type Transport = "graphql" | "rest";
  * terminal becomes `.execute()`.
  */
 export type MutationKind = "insert" | "update" | "delete";
+
+type ModifierKey = "_vector" | "_aggregate" | "_orderBy" | "_limit" | "_offset";
 
 export class QueryBuilder<T = Record<string, unknown>> {
   private _select: string[] = [];
@@ -344,6 +379,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
   }
 
   async count(): Promise<number> {
+    this.assertOnlyConditionsOf("count()", ["_vector", "_aggregate", "_orderBy", "_limit", "_offset"]);
     if (this._transport === "rest") {
       // PostgREST `Prefer: count=exact` returns total in the pagination envelope.
       const builder = this.cloneForCount();
@@ -369,7 +405,10 @@ export class QueryBuilder<T = Record<string, unknown>> {
 
   toGraphql(): { document: string } {
     if (this._mutationKind != null) return this.toGraphqlMutation();
-    if (this._aggregate != null) return this.toGraphqlAggregate();
+    if (this._aggregate != null) {
+      this.assertOnlyConditionsOf("an aggregate", ["_vector", "_orderBy", "_limit", "_offset"]);
+      return this.toGraphqlAggregate();
+    }
 
     const field = assertName(this.graphqlField, "field name");
     const args: string[] = [];
@@ -402,27 +441,38 @@ export class QueryBuilder<T = Record<string, unknown>> {
   }
 
   private buildWhereParts(): string | null {
-    const hasCols = this._where != null && Object.keys(this._where).filter(k => k !== "_or").length > 0;
-    const hasOr = this._or != null && this._or.length > 0;
-    const hasWhereOr = this._where?._or != null && this._where._or.length > 0;
-    if (!hasCols && !hasOr && !hasWhereOr) return null;
+    if (this._where != null) validateWhere(this._where);
+    if (this._or != null) validateOrList(this._or);
+    const { _or: whereOr, ...columns } = (this._where ?? {}) as WhereInput;
+    if (this._or != null && whereOr != null) {
+      throw new ConfigError("Use either .or() or where({ _or }), not both");
+    }
+    const entries = Object.entries(columns).map(([col, ops]) => this.serializeColumnFilter(col, ops));
+    const orConditions = this._or ?? whereOr;
+    if (orConditions != null) {
+      entries.push(`_or: [${orConditions.map((w) => this.serializeWhereTyped(w)).join(", ")}]`);
+    }
+    return entries.length > 0 ? `{ ${entries.join(", ")} }` : null;
+  }
 
-    const entries: string[] = [];
-    if (this._where != null) {
-      const { _or: _skip, ...rest } = this._where;
-      for (const [col, ops] of Object.entries(rest)) {
-        entries.push(this.serializeColumnFilter(col, ops));
+  /** Mutations send only a where (update, delete) and their rows; anything else set would be dropped. */
+  private assertMutationModifiers(): void {
+    this.assertOnlyConditionsOf("a mutation", ["_vector", "_aggregate", "_orderBy", "_limit", "_offset"]);
+    if (this._mutationKind === "insert" && (this._where != null || this._or != null)) {
+      throw new ConfigError("insert does not take .where() or .or()");
+    }
+  }
+
+  private assertOnlyConditionsOf(what: string, unsupported: ReadonlyArray<ModifierKey>): void {
+    for (const key of unsupported) {
+      if (this[key as ModifierKey] != null) {
+        throw new ConfigError(`${String(key).slice(1)} is not supported on ${what} and would be ignored`);
       }
     }
-    const orConditions = this._or ?? this._where?._or;
-    if (orConditions != null && orConditions.length > 0) {
-      const orParts = orConditions.map((w) => this.serializeWhereTyped(w));
-      entries.push(`_or: [${orParts.join(", ")}]`);
-    }
-    return `{ ${entries.join(", ")} }`;
   }
 
   private toGraphqlMutation(): { document: string } {
+    this.assertMutationModifiers();
     const projection = this._returning.length > 0 ? projectionOf(this._returning) : "__typename";
     const field = this.graphqlMutationField();
     let args = "";
@@ -435,15 +485,17 @@ export class QueryBuilder<T = Record<string, unknown>> {
         args = `inputs: [${inputs}]`;
       }
     } else if (this._mutationKind === "update") {
-      if (this._where == null) {
+      const whereParts = this.buildWhereParts();
+      if (whereParts == null) {
         throw new ConfigError(`update on "${this.graphqlField}" requires a .where(...) filter (refusing unfiltered update)`);
       }
-      args = `where: ${this.serializeWhereTyped(this._where)}, input: ${serializeRecord(this._updatePatch ?? {}, this.enumColumns)}`;
+      args = `where: ${whereParts}, input: ${serializeRecord(this._updatePatch ?? {}, this.enumColumns)}`;
     } else if (this._mutationKind === "delete") {
-      if (this._where == null) {
+      const whereParts = this.buildWhereParts();
+      if (whereParts == null) {
         throw new ConfigError(`delete on "${this.graphqlField}" requires a .where(...) filter (refusing unfiltered delete)`);
       }
-      args = `where: ${this.serializeWhereTyped(this._where)}`;
+      args = `where: ${whereParts}`;
     }
     const document = `mutation { ${field}(${args}) { ${projection} } }`;
     return { document };
@@ -467,6 +519,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
     if (this.rest == null) {
       throw new ConfigError(`REST mutation on "${this.graphqlField}" needs a REST descriptor`);
     }
+    this.assertMutationModifiers();
     if (this._mutationKind === "insert") {
       const rows = this._insertRows ?? [];
       const body = rows.length === 1 ? rows[0] : rows;
@@ -483,6 +536,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
       }
       assertNoRestOr(this._where, this._or);
       const qs = serializeRestWhere(this._where);
+      if (qs === "") throw new ConfigError(`${this._mutationKind} via REST on "${this.graphqlField}" needs a non-empty filter`);
       const result = await this.db.rest.patch<{ data?: T[] } | T[]>(
         `/${this.rest.table}?${qs}`,
         this._updatePatch ?? {},
@@ -496,6 +550,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
       }
       assertNoRestOr(this._where, this._or);
       const qs = serializeRestWhere(this._where);
+      if (qs === "") throw new ConfigError(`${this._mutationKind} via REST on "${this.graphqlField}" needs a non-empty filter`);
       const result = await this.db.rest.delete<{ data?: T[] } | T[]>(
         `/${this.rest.table}?${qs}`,
         { headers: this.contentProfileHeaders() },
@@ -557,6 +612,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
       throw new ConfigError(`toRest() called without a REST descriptor on db.from("${this.graphqlField}")`);
     }
     assertNoRestOr(this._where, this._or);
+    this.assertOnlyConditionsOf("REST", ["_vector", "_aggregate"]);
     const params = new URLSearchParams();
     if (this._select.length > 0) params.set("select", this._select.join(","));
     if (this._where != null) {
@@ -646,8 +702,7 @@ function serializeEnum(value: unknown): string {
 }
 
 function assertNoRestOr(where: WhereInput | null, or: WhereInput[] | null): void {
-  const has = (list?: WhereInput[] | null) => list != null && list.length > 0;
-  if (has(or) || has(where?._or)) {
+  if (or != null || (where != null && "_or" in where)) {
     throw new ConfigError("REST cannot send an or-group; use the GraphQL transport for .or() and _or");
   }
 }
@@ -658,6 +713,7 @@ function assertNoRestOr(where: WhereInput | null, or: WhereInput[] | null): void
  * would be dropped and the call would match more rows than asked: refuse it.
  */
 function restFilterParams(where: WhereInput): Array<[string, string]> {
+  validateWhere(where);
   const pairs: Array<[string, string]> = [];
   for (const [col, ops] of Object.entries(where)) {
     if (col === "_or") continue; // refused by assertNoRestOr before this runs
