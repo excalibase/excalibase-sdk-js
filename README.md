@@ -439,8 +439,12 @@ await db.auth.revokeApiKey(created.id);
 ## Session persistence
 
 By default the SDK stores the session in `localStorage` when a browser is
-detected, and in memory otherwise. Pass a custom `StorageAdapter` to integrate
-with secure storage:
+detected, and in memory otherwise.
+
+`localStorage` is readable by any script running on your page, so a cross-site
+scripting bug can read the session tokens. If that matters for your app, pass
+`memoryStorageAdapter()` (the session then lasts only until the page reloads) or
+your own `StorageAdapter` backed by secure storage:
 
 ```ts
 import { createClient, memoryStorageAdapter } from "@excalibase/sdk";

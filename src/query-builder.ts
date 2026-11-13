@@ -56,23 +56,139 @@ function isForceUnquoted(v: unknown): v is ForceUnquoted {
 }
 
 const ENUM_LIKE = /^[a-z_][a-z0-9_]*$/;
+const GRAPHQL_NAME = /^[_A-Za-z][_0-9A-Za-z]*$/;
+const KEYWORD_LITERALS = new Set(["true", "false", "null"]);
+
+/**
+ * Every field, column, operator and enum name is written into the query text,
+ * so each one must be a plain GraphQL name. Anything else throws before a
+ * request is built.
+ */
+function assertName(name: unknown, what: string): string {
+  if (typeof name !== "string" || !GRAPHQL_NAME.test(name)) {
+    const shown = String(name).length > 40 ? `${String(name).slice(0, 40)}...` : String(name);
+    throw new ConfigError(`Invalid ${what} "${shown}": must match ${GRAPHQL_NAME.source}`);
+  }
+  return name;
+}
+
+const MAX_VALUE_DEPTH = 1000;
+
+/**
+ * Walks a value fully before it is serialized: a nested `undefined` would
+ * become a missing key or `null`, and a cycle or extreme depth would overflow
+ * the stack. Objects on the current path are tracked, so a shared reference
+ * that is not a cycle stays allowed.
+ */
+function assertDefined(value: unknown, what: string, depth = 0, path = new Set<object>()): void {
+  if (value === undefined) {
+    throw new ConfigError(`${what} contains undefined; use null for NULL or leave the key out`);
+  }
+  if (typeof value !== "object" || value === null) return;
+  if (depth >= MAX_VALUE_DEPTH) throw new ConfigError(`${what} is nested deeper than ${MAX_VALUE_DEPTH} levels`);
+  if (path.has(value)) throw new ConfigError(`${what} contains a circular reference`);
+  path.add(value);
+  try {
+    const children = Array.isArray(value)
+      ? value
+      : isForceQuoted(value) || isForceUnquoted(value)
+        ? [value.value]
+        : Object.values(value);
+    for (const child of children) assertDefined(child, what, depth + 1, path);
+  } finally {
+    path.delete(value);
+  }
+}
+
+/** Top-level undefined keys are dropped (as on GraphQL); nested ones are refused. */
+function assertRowsDefined(rows: ReadonlyArray<Record<string, unknown>>): void {
+  for (const row of rows) {
+    for (const [key, value] of Object.entries(row)) {
+      if (value !== undefined) assertDefined(value, `column "${key}"`);
+    }
+  }
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function validateColumnFilter(col: string, ops: unknown): void {
+  if (!isPlainObject(ops) || Object.keys(ops).length === 0) {
+    throw new ConfigError(`Filter on "${col}" must be an object with at least one operator`);
+  }
+  if ("not" in ops) {
+    const inner = ops.not;
+    if (!isPlainObject(inner) || Object.keys(inner).length === 0 || "not" in inner) {
+      throw new ConfigError(`"not" on "${col}" must be an object with at least one operator and no nested "not"`);
+    }
+  }
+}
+
+function validateOrList(list: unknown): void {
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new ConfigError("_or / .or() must be a non-empty array of filters");
+  }
+  for (const condition of list) validateWhere(condition, true);
+}
+
+/** Every part of a where is sent or refused, never dropped. */
+function validateWhere(where: unknown, requireColumns = false): void {
+  if (!isPlainObject(where)) throw new ConfigError("A where filter must be an object");
+  for (const [col, ops] of Object.entries(where)) {
+    if (col === "_or") validateOrList(ops);
+    else validateColumnFilter(col, ops);
+  }
+  if (requireColumns && Object.keys(where).length === 0) throw new ConfigError("An _or condition cannot be empty");
+}
+
+/** An enum value is a bare name, and `null`, `true` and `false` would read as keywords. */
+function assertEnumValue(value: unknown): string {
+  const name = assertName(value, "enum value");
+  if (KEYWORD_LITERALS.has(name)) throw new ConfigError(`Invalid enum value "${name}": reserved word`);
+  return name;
+}
+
+function assertWholeNumber(n: unknown, what: string): number {
+  if (typeof n !== "number" || !Number.isInteger(n)) {
+    throw new ConfigError(`${what} must be an integer`);
+  }
+  return n;
+}
+
+function finiteNumber(n: number, what: string): string {
+  if (!Number.isFinite(n)) throw new ConfigError(`${what} must be a finite number`);
+  return String(n);
+}
 
 function serializeGraphqlValue(v: unknown): string {
-  if (v === null || v === undefined) return "null";
-  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  assertDefined(v, "value");
+  return serializeChecked(v);
+}
+
+function serializeChecked(v: unknown): string {
+  if (v === undefined) throw new ConfigError("undefined is not a valid value; use null for NULL or leave the key out");
+  if (v === null) return "null";
+  if (typeof v === "number") return finiteNumber(v, "filter value");
+  if (typeof v === "boolean") return String(v);
+  if (typeof v === "bigint") return v.toString();
   if (isForceQuoted(v)) return JSON.stringify(v.value);
-  if (isForceUnquoted(v)) return v.value;
-  if (Array.isArray(v)) return `[${v.map(serializeGraphqlValue).join(", ")}]`;
+  if (isForceUnquoted(v)) return assertEnumValue(v.value);
+  if (Array.isArray(v)) return `[${v.map(serializeChecked).join(", ")}]`;
   if (typeof v === "string") {
-    return ENUM_LIKE.test(v) ? v : JSON.stringify(v);
+    return ENUM_LIKE.test(v) && !KEYWORD_LITERALS.has(v) ? v : JSON.stringify(v);
   }
   if (typeof v === "object") {
     const entries = Object.entries(v as Record<string, unknown>).map(
-      ([k, val]) => `${k}: ${serializeGraphqlValue(val)}`,
+      ([k, val]) => `${assertName(k, "filter key")}: ${serializeChecked(val)}`,
     );
     return `{ ${entries.join(", ")} }`;
   }
-  return JSON.stringify(v);
+  throw new ConfigError(`Unsupported value of type ${typeof v}`);
+}
+
+function projectionOf(columns: readonly string[]): string {
+  return columns.map((c) => assertName(c, "column")).join(" ");
 }
 
 // ---------- Types ----------
@@ -143,6 +259,8 @@ export type Transport = "graphql" | "rest";
  * terminal becomes `.execute()`.
  */
 export type MutationKind = "insert" | "update" | "delete";
+
+type ModifierKey = "_vector" | "_aggregate" | "_orderBy" | "_limit" | "_offset";
 
 export class QueryBuilder<T = Record<string, unknown>> {
   private _select: string[] = [];
@@ -298,12 +416,15 @@ export class QueryBuilder<T = Record<string, unknown>> {
   }
 
   async first(): Promise<T | null> {
-    this._limit = 1;
-    const rows = await this.all();
+    // Work on a copy so the caller's builder keeps its own limit.
+    const copy: QueryBuilder<T> = Object.assign(Object.create(Object.getPrototypeOf(this)), this);
+    copy._limit = 1;
+    const rows = await copy.all();
     return rows[0] ?? null;
   }
 
   async count(): Promise<number> {
+    this.assertOnlyConditionsOf("count()", ["_vector", "_aggregate", "_orderBy", "_limit", "_offset"]);
     if (this._transport === "rest") {
       // PostgREST `Prefer: count=exact` returns total in the pagination envelope.
       const builder = this.cloneForCount();
@@ -317,8 +438,9 @@ export class QueryBuilder<T = Record<string, unknown>> {
       return response.pagination?.total ?? 0;
     }
     // GraphQL: use the sibling <Field>Aggregate field with the same where.
-    const aggregateField = `${this.graphqlField}Aggregate`;
-    const whereClause = this._where != null ? `(where: ${this.serializeWhereTyped(this._where)})` : "";
+    const aggregateField = `${assertName(this.graphqlField, "field name")}Aggregate`;
+    const whereParts = this.buildWhereParts();
+    const whereClause = whereParts != null ? `(where: ${whereParts})` : "";
     const document = `{ ${aggregateField}${whereClause} { count } }`;
     const data = await this.db.graphql.query<Record<string, { count: number }>>(document);
     return data[aggregateField]?.count ?? 0;
@@ -328,18 +450,22 @@ export class QueryBuilder<T = Record<string, unknown>> {
 
   toGraphql(): { document: string } {
     if (this._mutationKind != null) return this.toGraphqlMutation();
-    if (this._aggregate != null) return this.toGraphqlAggregate();
+    if (this._aggregate != null) {
+      this.assertOnlyConditionsOf("an aggregate", ["_vector", "_orderBy", "_limit", "_offset"]);
+      return this.toGraphqlAggregate();
+    }
 
+    const field = assertName(this.graphqlField, "field name");
     const args: string[] = [];
     const whereParts = this.buildWhereParts();
     if (whereParts != null) args.push(`where: ${whereParts}`);
     if (this._vector != null) args.push(`vector: ${serializeVectorInput(this._vector)}`);
     if (this._orderBy != null) args.push(`orderBy: ${serializeOrderBy(this._orderBy)}`);
-    if (this._limit != null) args.push(`limit: ${this._limit}`);
-    if (this._offset != null) args.push(`offset: ${this._offset}`);
+    if (this._limit != null) args.push(`limit: ${assertWholeNumber(this._limit, "limit")}`);
+    if (this._offset != null) args.push(`offset: ${assertWholeNumber(this._offset, "offset")}`);
     const argString = args.length > 0 ? `(${args.join(", ")})` : "";
-    const projection = this._select.length > 0 ? this._select.join(" ") : "__typename";
-    const document = `{ ${this.graphqlField}${argString} { ${projection} } }`;
+    const projection = this._select.length > 0 ? projectionOf(this._select) : "__typename";
+    const document = `{ ${field}${argString} { ${projection} } }`;
     return { document };
   }
 
@@ -350,38 +476,49 @@ export class QueryBuilder<T = Record<string, unknown>> {
     for (const fn of ["sum", "avg", "min", "max"] as const) {
       const cols = agg[fn];
       if (cols != null && cols.length > 0) {
-        parts.push(`${fn} { ${cols.join(" ")} }`);
+        parts.push(`${fn} { ${projectionOf(cols)} }`);
       }
     }
     const whereParts = this.buildWhereParts();
     const whereArg = whereParts != null ? `(where: ${whereParts})` : "";
-    const document = `{ ${this.graphqlField}Aggregate${whereArg} { ${parts.join(" ")} } }`;
+    const document = `{ ${assertName(this.graphqlField, "field name")}Aggregate${whereArg} { ${parts.join(" ")} } }`;
     return { document };
   }
 
   private buildWhereParts(): string | null {
-    const hasCols = this._where != null && Object.keys(this._where).filter(k => k !== "_or").length > 0;
-    const hasOr = this._or != null && this._or.length > 0;
-    const hasWhereOr = this._where?._or != null && this._where._or.length > 0;
-    if (!hasCols && !hasOr && !hasWhereOr) return null;
+    if (this._where != null) validateWhere(this._where);
+    if (this._or != null) validateOrList(this._or);
+    const { _or: whereOr, ...columns } = (this._where ?? {}) as WhereInput;
+    if (this._or != null && whereOr != null) {
+      throw new ConfigError("Use either .or() or where({ _or }), not both");
+    }
+    const entries = Object.entries(columns).map(([col, ops]) => this.serializeColumnFilter(col, ops));
+    const orConditions = this._or ?? whereOr;
+    if (orConditions != null) {
+      entries.push(`_or: [${orConditions.map((w) => this.serializeWhereTyped(w)).join(", ")}]`);
+    }
+    return entries.length > 0 ? `{ ${entries.join(", ")} }` : null;
+  }
 
-    const entries: string[] = [];
-    if (this._where != null) {
-      const { _or: _skip, ...rest } = this._where;
-      for (const [col, ops] of Object.entries(rest)) {
-        entries.push(this.serializeColumnFilter(col, ops));
+  /** Mutations send only a where (update, delete) and their rows; anything else set would be dropped. */
+  private assertMutationModifiers(): void {
+    this.assertOnlyConditionsOf("a mutation", ["_vector", "_aggregate", "_orderBy", "_limit", "_offset"]);
+    if (this._mutationKind === "insert" && (this._where != null || this._or != null)) {
+      throw new ConfigError("insert does not take .where() or .or()");
+    }
+  }
+
+  private assertOnlyConditionsOf(what: string, unsupported: ReadonlyArray<ModifierKey>): void {
+    for (const key of unsupported) {
+      if (this[key as ModifierKey] != null) {
+        throw new ConfigError(`${String(key).slice(1)} is not supported on ${what} and would be ignored`);
       }
     }
-    const orConditions = this._or ?? this._where?._or;
-    if (orConditions != null && orConditions.length > 0) {
-      const orParts = orConditions.map((w) => this.serializeWhereTyped(w));
-      entries.push(`_or: [${orParts.join(", ")}]`);
-    }
-    return `{ ${entries.join(", ")} }`;
   }
 
   private toGraphqlMutation(): { document: string } {
-    const projection = this._returning.length > 0 ? this._returning.join(" ") : "__typename";
+    this.assertMutationModifiers();
+    const projection = this._returning.length > 0 ? projectionOf(this._returning) : "__typename";
     const field = this.graphqlMutationField();
     let args = "";
     if (this._mutationKind === "insert") {
@@ -393,15 +530,19 @@ export class QueryBuilder<T = Record<string, unknown>> {
         args = `inputs: [${inputs}]`;
       }
     } else if (this._mutationKind === "update") {
-      if (this._where == null) {
+      const whereParts = this.buildWhereParts();
+      if (whereParts == null) {
         throw new ConfigError(`update on "${this.graphqlField}" requires a .where(...) filter (refusing unfiltered update)`);
       }
-      args = `where: ${this.serializeWhereTyped(this._where)}, input: ${serializeRecord(this._updatePatch ?? {}, this.enumColumns)}`;
+      const patch = serializeRecord(this._updatePatch ?? {}, this.enumColumns);
+      if (patch === "{  }") throw new ConfigError(`update on "${this.graphqlField}" has no values to set`);
+      args = `where: ${whereParts}, input: ${patch}`;
     } else if (this._mutationKind === "delete") {
-      if (this._where == null) {
+      const whereParts = this.buildWhereParts();
+      if (whereParts == null) {
         throw new ConfigError(`delete on "${this.graphqlField}" requires a .where(...) filter (refusing unfiltered delete)`);
       }
-      args = `where: ${this.serializeWhereTyped(this._where)}`;
+      args = `where: ${whereParts}`;
     }
     const document = `mutation { ${field}(${args}) { ${projection} } }`;
     return { document };
@@ -411,7 +552,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
     // GraphQL field names follow the same Capitalize convention used by the
     // server: `kanbanIssues` → `createKanbanIssues` / `updateKanbanIssues` /
     // `deleteKanbanIssues`. Bulk insert uses `createMany<Type>`.
-    const cap = this.graphqlField.charAt(0).toUpperCase() + this.graphqlField.slice(1);
+    const cap = assertName(this.graphqlField, "field name").charAt(0).toUpperCase() + this.graphqlField.slice(1);
     if (this._mutationKind === "insert") {
       const isBulk = (this._insertRows?.length ?? 0) > 1;
       return isBulk ? `createMany${cap}` : `create${cap}`;
@@ -425,8 +566,13 @@ export class QueryBuilder<T = Record<string, unknown>> {
     if (this.rest == null) {
       throw new ConfigError(`REST mutation on "${this.graphqlField}" needs a REST descriptor`);
     }
+    this.assertMutationModifiers();
+    if (this._returning.length > 0) {
+      throw new ConfigError("returning() is not supported over REST writes; use the GraphQL transport");
+    }
     if (this._mutationKind === "insert") {
       const rows = this._insertRows ?? [];
+      assertRowsDefined(rows as ReadonlyArray<Record<string, unknown>>);
       const body = rows.length === 1 ? rows[0] : rows;
       const result = await this.db.rest.post<{ data?: T[] } | T[]>(
         `/${this.rest.table}`,
@@ -439,7 +585,13 @@ export class QueryBuilder<T = Record<string, unknown>> {
       if (this._where == null) {
         throw new ConfigError(`update via REST on "${this.graphqlField}" requires a .where(...) filter`);
       }
+      assertNoRestOr(this._where, this._or);
       const qs = serializeRestWhere(this._where);
+      if (qs === "") throw new ConfigError(`${this._mutationKind} via REST on "${this.graphqlField}" needs a non-empty filter`);
+      assertRowsDefined([(this._updatePatch ?? {}) as Record<string, unknown>]);
+      if (Object.values(this._updatePatch ?? {}).every((v) => v === undefined)) {
+        throw new ConfigError(`update on "${this.graphqlField}" has no values to set`);
+      }
       const result = await this.db.rest.patch<{ data?: T[] } | T[]>(
         `/${this.rest.table}?${qs}`,
         this._updatePatch ?? {},
@@ -451,7 +603,9 @@ export class QueryBuilder<T = Record<string, unknown>> {
       if (this._where == null) {
         throw new ConfigError(`delete via REST on "${this.graphqlField}" requires a .where(...) filter`);
       }
+      assertNoRestOr(this._where, this._or);
       const qs = serializeRestWhere(this._where);
+      if (qs === "") throw new ConfigError(`${this._mutationKind} via REST on "${this.graphqlField}" needs a non-empty filter`);
       const result = await this.db.rest.delete<{ data?: T[] } | T[]>(
         `/${this.rest.table}?${qs}`,
         { headers: this.contentProfileHeaders() },
@@ -491,17 +645,17 @@ export class QueryBuilder<T = Record<string, unknown>> {
       // "not" wraps a nested ColumnFilter
       if (op === "not" && typeof value === "object" && value !== null && !Array.isArray(value)) {
         const inner = Object.entries(value as Record<string, unknown>)
-          .map(([k, v]) => `${k}: ${this.serializeValue(col, v, isEnum, schemaKnown)}`)
+          .map(([k, v]) => `${assertName(k, "operator")}: ${this.serializeValue(col, v, isEnum, schemaKnown)}`)
           .join(", ");
         return `not: { ${inner} }`;
       }
-      return `${op}: ${this.serializeValue(col, value, isEnum, schemaKnown)}`;
+      return `${assertName(op, "operator")}: ${this.serializeValue(col, value, isEnum, schemaKnown)}`;
     });
-    return `${col}: { ${opEntries.join(", ")} }`;
+    return `${assertName(col, "column")}: { ${opEntries.join(", ")} }`;
   }
 
   private serializeValue(_col: string, value: unknown, isEnum: boolean, schemaKnown: boolean): string {
-    if (isEnum && typeof value === "string") return value;
+    if (isEnum) return serializeEnum(value);
     if (schemaKnown && typeof value === "string" && !isForceQuoted(value) && !isForceUnquoted(value)) {
       return JSON.stringify(value);
     }
@@ -512,14 +666,12 @@ export class QueryBuilder<T = Record<string, unknown>> {
     if (this.rest == null) {
       throw new ConfigError(`toRest() called without a REST descriptor on db.from("${this.graphqlField}")`);
     }
+    assertNoRestOr(this._where, this._or);
+    this.assertOnlyConditionsOf("REST", ["_vector", "_aggregate"]);
     const params = new URLSearchParams();
     if (this._select.length > 0) params.set("select", this._select.join(","));
     if (this._where != null) {
-      for (const [col, ops] of Object.entries(this._where)) {
-        for (const [op, value] of Object.entries(ops) as Array<[FilterOp, FilterValue]>) {
-          params.append(col, serializeRestFilter(op, value));
-        }
-      }
+      for (const [col, filter] of restFilterParams(this._where)) params.append(col, filter);
     }
     if (this._orderBy != null) {
       const parts = Object.entries(this._orderBy).map(([col, dir]) => `${col}.${String(dir).toLowerCase()}`);
@@ -542,6 +694,7 @@ export class QueryBuilder<T = Record<string, unknown>> {
   private cloneForCount(): QueryBuilder<T> {
     const clone = new QueryBuilder<T>(this.db, this.graphqlField, this.rest, this.enumColumns);
     clone._where = this._where;
+    clone._or = this._or;
     clone._limit = 1;
     clone._offset = 0;
     clone._transport = this._transport;
@@ -556,64 +709,111 @@ export class QueryBuilder<T = Record<string, unknown>> {
  * are emitted as bare GraphQL identifiers; everything else uses
  * {@link serializeGraphqlValue} which keeps strings quoted.
  */
+const VECTOR_DISTANCES = new Set(["L2", "COSINE", "IP"]);
+
+function badVector(): never {
+  throw new ConfigError("vector near must be an array of numbers");
+}
+
 function serializeVectorInput(v: VectorSearchInput): string {
   const parts: string[] = [];
-  parts.push(`column: "${v.column}"`);
-  parts.push(`near: [${v.near.join(", ")}]`);
-  if (v.distance != null) parts.push(`distance: ${v.distance}`);
-  if (v.limit != null) parts.push(`limit: ${v.limit}`);
+  parts.push(`column: ${JSON.stringify(String(v.column))}`);
+  parts.push(`near: [${v.near.map((n) => (typeof n === "number" ? finiteNumber(n, "vector component") : badVector())).join(", ")}]`);
+  if (v.distance != null) {
+    if (!VECTOR_DISTANCES.has(v.distance)) throw new ConfigError("vector distance must be L2, COSINE or IP");
+    parts.push(`distance: ${v.distance}`);
+  }
+  if (v.limit != null) parts.push(`limit: ${assertWholeNumber(v.limit, "vector limit")}`);
   return `{ ${parts.join(", ")} }`;
 }
 
 function serializeRecord(record: Record<string, unknown>, enumColumns?: readonly string[]): string {
   const enumSet = new Set(enumColumns ?? []);
   const schemaKnown = enumColumns !== undefined;
-  const entries = Object.entries(record).map(([col, value]) => {
+  const entries = Object.entries(record).filter(([, value]) => value !== undefined).map(([col, value]) => {
     let serialized: string;
     if (enumSet.has(col) && typeof value === "string") {
-      serialized = value;
+      serialized = assertEnumValue(value);
     } else if (schemaKnown && typeof value === "string" && !isForceQuoted(value) && !isForceUnquoted(value)) {
       serialized = JSON.stringify(value);
     } else {
       serialized = serializeGraphqlValue(value);
     }
-    return `${col}: ${serialized}`;
+    return `${assertName(col, "column")}: ${serialized}`;
   });
   return `{ ${entries.join(", ")} }`;
 }
 
-function serializeRestWhere(where: WhereInput): string {
-  const params = new URLSearchParams();
+function orderDirection(dir: unknown): string {
+  const upper = String(dir).toUpperCase();
+  if (upper !== "ASC" && upper !== "DESC") throw new ConfigError(`orderBy direction must be asc or desc`);
+  return upper;
+}
+
+function serializeEnum(value: unknown): string {
+  if (typeof value === "string") return assertEnumValue(value);
+  if (Array.isArray(value)) return `[${value.map(serializeEnum).join(", ")}]`;
+  return serializeGraphqlValue(value);
+}
+
+function assertNoRestOr(where: WhereInput | null, or: WhereInput[] | null): void {
+  if (or != null || (where != null && "_or" in where)) {
+    throw new ConfigError("REST cannot send an or-group; use the GraphQL transport for .or() and _or");
+  }
+}
+
+/**
+ * Flattens a where into `[column, filter]` pairs. The engine's REST handlers
+ * keep one value per parameter name, so a second filter on the same column
+ * would be dropped and the call would match more rows than asked: refuse it.
+ */
+function restFilterParams(where: WhereInput): Array<[string, string]> {
+  validateWhere(where);
+  const pairs: Array<[string, string]> = [];
   for (const [col, ops] of Object.entries(where)) {
-    if (col === "_or") continue; // _or has no PostgREST equivalent — skip
+    if (col === "_or") continue; // refused by assertNoRestOr before this runs
+    const columnPairs: Array<[string, string]> = [];
     for (const [op, value] of Object.entries(ops) as Array<[FilterOp, FilterValue]>) {
       if (op === "not") {
-        // PostgREST negation: prefix each inner op with `not.`
         if (typeof value === "object" && value !== null && !Array.isArray(value)) {
           for (const [innerOp, innerVal] of Object.entries(value) as Array<[FilterOp, FilterValue]>) {
-            params.append(col, `not.${serializeRestFilter(innerOp, innerVal)}`);
+            columnPairs.push([col, `not.${serializeRestFilter(innerOp, innerVal)}`]);
           }
         }
         continue;
       }
-      params.append(col, serializeRestFilter(op, value));
+      columnPairs.push([col, serializeRestFilter(op, value)]);
     }
+    if (columnPairs.length > 1) {
+      throw new ConfigError(`REST can send only one filter per column; "${col}" has ${columnPairs.length}. Use the GraphQL transport.`);
+    }
+    pairs.push(...columnPairs);
   }
+  return pairs;
+}
+
+function serializeRestWhere(where: WhereInput): string {
+  const params = new URLSearchParams();
+  for (const [col, filter] of restFilterParams(where)) params.append(col, filter);
   return params.toString();
 }
 
 function serializeOrderBy(spec: OrderBySpec): string {
-  const entries = Object.entries(spec).map(([col, dir]) => `${col}: ${String(dir).toUpperCase()}`);
+  const entries = Object.entries(spec).map(
+    ([col, dir]) => `${assertName(col, "orderBy column")}: ${orderDirection(dir)}`,
+  );
   return `{ ${entries.join(", ")} }`;
 }
 
 function serializeRestFilter(op: FilterOp, value: FilterValue): string {
   const v = extractRaw(value);
+  assertDefined(v, `${op} filter value`);
   switch (op) {
     case "in":
     case "notIn":
       if (!Array.isArray(v)) throw new ConfigError(`${op} expects an array value`);
-      return `${restOp(op)}.(${v.map((x) => String(x)).join(",")})`;
+      if (v.length === 0) throw new ConfigError(`${op} over REST needs at least one value`);
+      return `${restOp(op)}.(${v.map(inListItem).join(",")})`;
     case "isNull":
       return v ? "is.null" : "not.is.null";
     case "isNotNull":
@@ -622,17 +822,44 @@ function serializeRestFilter(op: FilterOp, value: FilterValue): string {
     case "arrayHasAll":
     case "arrayHasAny":
       if (!Array.isArray(v)) throw new ConfigError(`${op} expects an array value`);
-      return `${restOp(op)}.{${v.map((x) => String(x)).join(",")}}`;
+      return `${restOp(op)}.{${v.map(restListItem).join(",")}}`;
     case "hasKeys":
     case "hasAnyKeys":
       if (!Array.isArray(v)) throw new ConfigError(`${op} expects an array value`);
-      return `${restOp(op)}.(${v.map((x) => String(x)).join(",")})`;
+      return `${restOp(op)}.(${v.map(inListItem).join(",")})`;
+    case "contains":
+      return `ilike.%${escapeLike(String(v))}%`;
     case "jsonContains":
     case "containedBy":
       return `${restOp(op)}.${typeof v === "object" ? JSON.stringify(v) : String(v)}`;
     default:
       return `${restOp(op)}.${String(v)}`;
   }
+}
+
+/**
+ * One member of a PostgREST list (`in.(...)`, `cs.{...}`). A value holding a
+ * separator, bracket, quote, backslash or whitespace is double-quoted with
+ * `"` and `\\` escaped, so it stays one member and cannot add filters.
+ */
+function restListItem(x: unknown): string {
+  const text = String(x);
+  if (text !== "" && !/[,()"\\{}\s]/.test(text)) return text;
+  return `"${text.replace(/[\\"]/g, "\\$&")}"`;
+}
+
+/**
+ * The engine splits an `in.(...)` list on every comma and never strips quotes,
+ * so a value holding a comma would become extra members. Refuse it.
+ */
+function inListItem(x: unknown): string {
+  const text = String(x);
+  if (text.includes(",")) throw new ConfigError(`in/notIn values cannot contain a comma: "${text.slice(0, 40)}"`);
+  return text;
+}
+
+function escapeLike(text: string): string {
+  return text.replace(/[\\%_]/g, "\\$&");
 }
 
 function restOp(op: FilterOp): string {
@@ -646,8 +873,8 @@ function restOp(op: FilterOp): string {
     case "in": return "in";
     case "notIn": return "not.in";
     case "contains": return "ilike";
-    case "startsWith": return "like";
-    case "endsWith": return "like";
+    case "startsWith": return "startswith";
+    case "endsWith": return "endswith";
     case "like": return "like";
     case "ilike": return "ilike";
     case "isNull": return "is";
