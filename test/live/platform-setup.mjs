@@ -23,12 +23,13 @@ const API = required("PROVISIONING_URL");
 const EDGE = required("SDK_LIVE_URL");
 const PASSWORD = readFileSync(required("ADMIN_PASSWORD_FILE"), "utf8").trim();
 
-async function call(method, url, { token, body } = {}) {
+async function call(method, url, { token, body, headers = {} } = {}) {
   const response = await fetch(url, {
     method,
     headers: {
       ...(body === undefined ? {} : { "Content-Type": "application/json" }),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...headers,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -68,7 +69,9 @@ async function waitActive(token, projectId) {
 }
 
 async function main() {
-  const { token } = await call("POST", `${API}/api/auth/login`, { body: { username: "admin", password: PASSWORD } });
+  const { token } = await call("POST", `${API}/api/auth/login`, {
+    headers: { "X-Return-Session-Token": "true" },
+    body: { username: "admin", password: PASSWORD } });
   const [org] = await call("GET", `${API}/api/orgs`, { token });
   const suffix = randomBytes(3).toString("hex");
   const created = await call("POST", `${API}/api/provision/`, {
