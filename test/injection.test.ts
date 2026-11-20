@@ -594,19 +594,22 @@ describe("strings inside JSON values stay quoted (EXC-731)", () => {
     expect(out).toContain('leaf: "doc"');
     expect(visits.count).toBeLessThanOrEqual(2 * (levels + 1));
   });
-  it("walks a shared DAG of arrays once per node", () => {
-    const visits = { count: 0 };
+  it("walks a shared DAG of arrays once per node, in the check and in the serializer", () => {
+    const reads = { iterator: 0, map: 0 };
     const track = (target: unknown[]): unknown[] =>
       new Proxy(target, {
         get(t, key, receiver) {
-          if (key === Symbol.iterator) visits.count++;
+          if (key === Symbol.iterator) reads.iterator++;
+          if (key === "map") reads.map++;
           return Reflect.get(t, key, receiver);
         },
       });
+    const levels = 16;
     let node: unknown[] = track(["doc"]);
-    for (let i = 0; i < 16; i++) node = track([node, node]);
+    for (let i = 0; i < levels; i++) node = track([node, node]);
     expect(() => meta({ v: node })).not.toThrow();
-    expect(visits.count).toBeLessThanOrEqual(2 * 17 + 2);
+    expect(reads.iterator).toBeLessThanOrEqual(levels + 1);
+    expect(reads.map).toBeLessThanOrEqual(levels + 1);
   });
   it("still refuses a cycle reached through a shared node", () => {
     const shared: Record<string, unknown> = { x: 1 };
@@ -618,5 +621,20 @@ describe("strings inside JSON values stay quoted (EXC-731)", () => {
     let deep: Record<string, unknown> = { v: 1 };
     for (let i = 0; i < 1001; i++) deep = { n: deep };
     expect(() => meta({ a: { b: deep }, c: deep })).toThrow(ConfigError);
+  });
+  // A shared node seen first near the root and again further down: only the remembered height can refuse it.
+  const sharedAtDepth = (wrappers: number): Record<string, unknown> => {
+    let deep: Record<string, unknown> = { v: 1 };
+    for (let i = 0; i < 990; i++) deep = { n: deep };
+    let wrapped: Record<string, unknown> = { d: deep };
+    for (let i = 0; i < wrappers; i++) wrapped = { w: wrapped };
+    return { first: deep, later: wrapped };
+  };
+  it("refuses a node first seen shallow and later reached too deep", () => {
+    expect(() => meta(sharedAtDepth(20))).toThrow(ConfigError);
+    expect(() => meta(sharedAtDepth(8))).toThrow(ConfigError);
+  });
+  it("accepts a shared node whose deepest leaf sits at the last allowed level", () => {
+    expect(() => meta(sharedAtDepth(7))).not.toThrow();
   });
 });
