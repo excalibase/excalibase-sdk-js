@@ -74,30 +74,49 @@ function assertName(name: unknown, what: string): string {
 
 const MAX_VALUE_DEPTH = 1000;
 
+type Visited = Map<object, number>;
+
+function childrenOf(value: object): unknown[] {
+  if (Array.isArray(value)) return value;
+  return isForceQuoted(value) || isForceUnquoted(value) ? [value.value] : Object.values(value);
+}
+
 /**
  * Walks a value fully before it is serialized: a nested `undefined` would
  * become a missing key or `null`, and a cycle or extreme depth would overflow
- * the stack. Objects on the current path are tracked, so a shared reference
- * that is not a cycle stays allowed.
+ * the stack. Objects on the current path are tracked to catch cycles; a node
+ * that finished without one is remembered with its height, so a shared
+ * reference is walked once, not once per appearance. Returns the node's height.
  */
-function assertDefined(value: unknown, what: string, depth = 0, path = new Set<object>()): void {
+function assertDefined(
+  value: unknown,
+  what: string,
+  depth = 0,
+  path = new Set<object>(),
+  done: Visited = new Map(),
+): number {
   if (value === undefined) {
     throw new ConfigError(`${what} contains undefined; use null for NULL or leave the key out`);
   }
-  if (typeof value !== "object" || value === null) return;
-  if (depth >= MAX_VALUE_DEPTH) throw new ConfigError(`${what} is nested deeper than ${MAX_VALUE_DEPTH} levels`);
+  if (typeof value !== "object" || value === null) return 0;
   if (path.has(value)) throw new ConfigError(`${what} contains a circular reference`);
+  const known = done.get(value);
+  if (known !== undefined) {
+    if (depth + known >= MAX_VALUE_DEPTH) throw new ConfigError(`${what} is nested deeper than ${MAX_VALUE_DEPTH} levels`);
+    return known + 1;
+  }
+  if (depth >= MAX_VALUE_DEPTH) throw new ConfigError(`${what} is nested deeper than ${MAX_VALUE_DEPTH} levels`);
   path.add(value);
+  let height = 0;
   try {
-    const children = Array.isArray(value)
-      ? value
-      : isForceQuoted(value) || isForceUnquoted(value)
-        ? [value.value]
-        : Object.values(value);
-    for (const child of children) assertDefined(child, what, depth + 1, path);
+    for (const child of childrenOf(value)) {
+      height = Math.max(height, assertDefined(child, what, depth + 1, path, done));
+    }
   } finally {
     path.delete(value);
   }
+  done.set(value, height);
+  return height + 1;
 }
 
 /** Top-level undefined keys are dropped (as on GraphQL); nested ones are refused. */
@@ -161,30 +180,46 @@ function finiteNumber(n: number, what: string): string {
   return String(n);
 }
 
-function serializeGraphqlValue(v: unknown): string {
+const JSON_VALUE_OPS = new Set(["jsonContains", "containedBy"]);
+
+function serializeGraphqlValue(v: unknown, bareListItems = false): string {
   assertDefined(v, "value");
-  return serializeChecked(v);
+  return serializeChecked(v, new Map(), false, bareListItems);
 }
 
-function serializeChecked(v: unknown): string {
+/**
+ * Top-level strings that look like a lowercase name go out bare, for enum
+ * columns on a client with no schema. Inside an object or array the value is
+ * JSON, where a bare name would be read as an enum literal, so every string
+ * there is a quoted, escaped GraphQL string. The one exception is the direct
+ * elements of a filter list (`in: [todo, done]`), which keep the name rule so
+ * schema-less enum lists still work; a client with a schema quotes them, and
+ * the JSON operators never take it. Finished containers are cached,
+ * so a shared reference is serialized once.
+ */
+function serializeChecked(v: unknown, memo = new Map<object, string>(), inContainer = false, bareListItems = false): string {
   if (v === undefined) throw new ConfigError("undefined is not a valid value; use null for NULL or leave the key out");
   if (v === null) return "null";
   if (typeof v === "number") return finiteNumber(v, "filter value");
   if (typeof v === "boolean") return String(v);
   if (typeof v === "bigint") return v.toString();
+  if (typeof v === "string") {
+    return !inContainer && ENUM_LIKE.test(v) && !KEYWORD_LITERALS.has(v) ? v : JSON.stringify(v);
+  }
+  if (typeof v !== "object") throw new ConfigError(`Unsupported value of type ${typeof v}`);
   if (isForceQuoted(v)) return JSON.stringify(v.value);
   if (isForceUnquoted(v)) return assertEnumValue(v.value);
-  if (Array.isArray(v)) return `[${v.map(serializeChecked).join(", ")}]`;
-  if (typeof v === "string") {
-    return ENUM_LIKE.test(v) && !KEYWORD_LITERALS.has(v) ? v : JSON.stringify(v);
-  }
-  if (typeof v === "object") {
-    const entries = Object.entries(v as Record<string, unknown>).map(
-      ([k, val]) => `${assertName(k, "filter key")}: ${serializeChecked(val)}`,
-    );
-    return `{ ${entries.join(", ")} }`;
-  }
-  throw new ConfigError(`Unsupported value of type ${typeof v}`);
+  const listOfScalars = bareListItems && Array.isArray(v);
+  const cacheable = !listOfScalars;
+  const cached = cacheable ? memo.get(v) : undefined;
+  if (cached !== undefined) return cached;
+  const text = Array.isArray(v)
+    ? `[${v.map((item) => serializeChecked(item, memo, !listOfScalars)).join(", ")}]`
+    : `{ ${Object.entries(v as Record<string, unknown>)
+        .map(([k, val]) => `${assertName(k, "filter key")}: ${serializeChecked(val, memo, true)}`)
+        .join(", ")} }`;
+  if (cacheable) memo.set(v, text);
+  return text;
 }
 
 function projectionOf(columns: readonly string[]): string {
@@ -645,21 +680,21 @@ export class QueryBuilder<T = Record<string, unknown>> {
       // "not" wraps a nested ColumnFilter
       if (op === "not" && typeof value === "object" && value !== null && !Array.isArray(value)) {
         const inner = Object.entries(value as Record<string, unknown>)
-          .map(([k, v]) => `${assertName(k, "operator")}: ${this.serializeValue(col, v, isEnum, schemaKnown)}`)
+          .map(([k, v]) => `${assertName(k, "operator")}: ${this.serializeValue(k, v, isEnum, schemaKnown)}`)
           .join(", ");
         return `not: { ${inner} }`;
       }
-      return `${assertName(op, "operator")}: ${this.serializeValue(col, value, isEnum, schemaKnown)}`;
+      return `${assertName(op, "operator")}: ${this.serializeValue(op, value, isEnum, schemaKnown)}`;
     });
     return `${assertName(col, "column")}: { ${opEntries.join(", ")} }`;
   }
 
-  private serializeValue(_col: string, value: unknown, isEnum: boolean, schemaKnown: boolean): string {
+  private serializeValue(op: string, value: unknown, isEnum: boolean, schemaKnown: boolean): string {
     if (isEnum) return serializeEnum(value);
     if (schemaKnown && typeof value === "string" && !isForceQuoted(value) && !isForceUnquoted(value)) {
       return JSON.stringify(value);
     }
-    return serializeGraphqlValue(value);
+    return serializeGraphqlValue(value, !JSON_VALUE_OPS.has(op));
   }
 
   toRest(): { path: string; headers: Record<string, string> } {
