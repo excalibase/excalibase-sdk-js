@@ -548,3 +548,75 @@ describe("deep and shared JSON values", () => {
     expect(() => plain().insert({ meta: nest(900) }).toGraphql()).not.toThrow();
   });
 });
+
+describe("strings inside JSON values stay quoted (EXC-731)", () => {
+  const meta = (value: unknown): string => plain().insert({ meta: value }).toGraphql().document as string;
+  const where = (value: unknown): string => plain().where({ m: { jsonContains: value } }).toGraphql().document as string;
+
+  it("quotes a string in a nested object, in an array and in both", () => {
+    expect(meta({ kind: "doc" })).toContain('{ kind: "doc" }');
+    expect(meta(["doc", "page"])).toContain('["doc", "page"]');
+    expect(meta({ a: { b: ["doc", { c: "x" }] } })).toContain('{ a: { b: ["doc", { c: "x" }] } }');
+    expect(where({ kind: "doc" })).toContain('{ kind: "doc" }');
+    expect(where(["doc"])).toContain('jsonContains: ["doc"]');
+  });
+  it.each(["doc", "_x", "a1", "todo", "true", "false", "null", "ABC", "Doc"])("quotes %s", (word) => {
+    expect(meta({ v: word })).toContain(`{ v: ${JSON.stringify(word)} }`);
+    expect(meta([word])).toContain(`[${JSON.stringify(word)}]`);
+  });
+  it("escapes quotes, backslashes, newlines and unicode", () => {
+    const text = 'say "hi" \\ back\nline\ttab   é 😀 \u0000';
+    const out = meta({ t: text, arr: [text] });
+    expect(out).toContain(`{ t: ${JSON.stringify(text)}, arr: [${JSON.stringify(text)}] }`);
+    expect(out).not.toContain("\n");
+  });
+  it("leaves numbers, booleans and null unchanged", () => {
+    expect(meta({ n: 1.5, i: -3, t: true, f: false, z: null, a: [1, true, null] })).toContain(
+      "{ n: 1.5, i: -3, t: true, f: false, z: null, a: [1, true, null] }",
+    );
+  });
+  it("still honours str() and unquoted() inside JSON", () => {
+    expect(meta({ a: str("doc"), b: unquoted("doc") })).toContain('{ a: "doc", b: doc }');
+  });
+  it("walks a shared-reference DAG once per node", () => {
+    const visits = { count: 0 };
+    const track = (target: object): object =>
+      new Proxy(target, {
+        ownKeys(t) {
+          visits.count++;
+          return Reflect.ownKeys(t);
+        },
+      });
+    let node: object = track({ leaf: "doc" });
+    const levels = 16;
+    for (let i = 0; i < levels; i++) node = track({ a: node, b: node });
+    const out = meta(node);
+    expect(out).toContain('leaf: "doc"');
+    expect(visits.count).toBeLessThanOrEqual(2 * (levels + 1));
+  });
+  it("walks a shared DAG of arrays once per node", () => {
+    const visits = { count: 0 };
+    const track = (target: unknown[]): unknown[] =>
+      new Proxy(target, {
+        get(t, key, receiver) {
+          if (key === Symbol.iterator) visits.count++;
+          return Reflect.get(t, key, receiver);
+        },
+      });
+    let node: unknown[] = track(["doc"]);
+    for (let i = 0; i < 16; i++) node = track([node, node]);
+    expect(() => meta({ v: node })).not.toThrow();
+    expect(visits.count).toBeLessThanOrEqual(2 * 17 + 2);
+  });
+  it("still refuses a cycle reached through a shared node", () => {
+    const shared: Record<string, unknown> = { x: 1 };
+    const a: Record<string, unknown> = { shared, then: { shared } };
+    (shared as Record<string, unknown>).back = a;
+    expect(() => meta(a)).toThrow(ConfigError);
+  });
+  it("still refuses depth past the limit when the deep node is shared", () => {
+    let deep: Record<string, unknown> = { v: 1 };
+    for (let i = 0; i < 1001; i++) deep = { n: deep };
+    expect(() => meta({ a: { b: deep }, c: deep })).toThrow(ConfigError);
+  });
+});
